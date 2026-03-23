@@ -17,6 +17,8 @@ dist-ssr
 .opcsoskills/
 .agents/
 .claude/
+skills/
+skills-lock.json
 src-tauri/target/
 src-tauri/.cargo/
 src-tauri/gen/
