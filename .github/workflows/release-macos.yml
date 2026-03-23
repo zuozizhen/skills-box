@@ -39,9 +39,10 @@ jobs:
       - name: Create draft release
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
           TAG: ${{ steps.meta.outputs.tag }}
         run: |
-          if gh release view "$TAG" >/dev/null 2>&1; then
+          if gh release view "$TAG" --repo "$GH_REPO" >/dev/null 2>&1; then
             echo "Draft or release for $TAG already exists, skip create."
           else
             prerelease_flag=""
@@ -49,6 +50,7 @@ jobs:
               prerelease_flag="--prerelease"
             fi
             gh release create "$TAG" \
+              --repo "$GH_REPO" \
               --draft \
               $prerelease_flag \
               --title "skills-box $TAG" \
@@ -94,6 +96,7 @@ jobs:
       - name: Upload artifacts to draft release
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
           TAG: ${{ needs.create-draft-release.outputs.tag }}
         run: |
           files="$(find src-tauri/target/release/bundle -type f \( -name '*.dmg' -o -name '*.app.tar.gz' -o -name '*.dmg.sig' -o -name '*.app.tar.gz.sig' \) -print)"
@@ -104,7 +107,7 @@ jobs:
           echo "$files" | while IFS= read -r file; do
             [ -z "$file" ] && continue
             echo "Uploading: $file"
-            gh release upload "$TAG" "$file" --clobber
+            gh release upload "$TAG" "$file" --repo "$GH_REPO" --clobber
           done
 
   publish-release:
@@ -117,10 +120,11 @@ jobs:
       - name: Publish draft release
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
           TAG: ${{ needs.create-draft-release.outputs.tag }}
         run: |
           if [[ "$TAG" == *-* ]]; then
-            gh release edit "$TAG" --draft=false --prerelease
+            gh release edit "$TAG" --repo "$GH_REPO" --draft=false --prerelease
           else
-            gh release edit "$TAG" --draft=false --latest
+            gh release edit "$TAG" --repo "$GH_REPO" --draft=false --latest
           fi
