@@ -1871,8 +1871,8 @@ fn check_for_updates_internal(current_version: String) -> Result<UpdateCheckResu
         return Err(message);
     }
 
-    let release: GithubLatestRelease = serde_json::from_str(&body)
-        .map_err(|_| "更新信息解析失败，请稍后重试".to_string())?;
+    let release: GithubLatestRelease =
+        serde_json::from_str(&body).map_err(|_| "更新信息解析失败，请稍后重试".to_string())?;
 
     let current_clean = normalize_version_value(&current_version);
     let latest_clean = normalize_version_value(&release.tag_name);
@@ -1908,8 +1908,10 @@ fn collect_watch_targets() -> Vec<(PathBuf, notify::RecursiveMode)> {
     let mut register = |path: PathBuf, mode: RecursiveMode| {
         let key = path.to_string_lossy().to_lowercase();
         let effective_mode = if let Some((_, old_mode)) = targets.get(&key) {
-            if matches!((old_mode, mode), (RecursiveMode::NonRecursive, RecursiveMode::Recursive))
-            {
+            if matches!(
+                (old_mode, mode),
+                (RecursiveMode::NonRecursive, RecursiveMode::Recursive)
+            ) {
                 RecursiveMode::Recursive
             } else {
                 *old_mode
@@ -2583,9 +2585,10 @@ async fn resummarize_skill(
     payload: ResummarizeSkillPayload,
 ) -> Result<SkillsSnapshot, String> {
     let app_for_task = app.clone();
-    let snapshot = tauri::async_runtime::spawn_blocking(move || resummarize_skill_internal(payload))
-        .await
-        .unwrap_or_else(|err| Err(format!("后台任务失败: {err}")))?;
+    let snapshot =
+        tauri::async_runtime::spawn_blocking(move || resummarize_skill_internal(payload))
+            .await
+            .unwrap_or_else(|err| Err(format!("后台任务失败: {err}")))?;
 
     set_tray_menu_from_snapshot(&app_for_task, &snapshot);
     emit_skills_snapshot(&app_for_task, &snapshot);
