@@ -1,65 +1,56 @@
 # skills-box
 
-`skills-box` is a desktop dashboard for discovering, browsing, and managing AI skills installed across local/global directories.
+`skills-box` 是一个面向普通用户的 macOS 桌面应用，用来查看、管理和理解你安装的各类 AI Skills。
 
-Built with:
+这不是给最终用户 `npm` 安装的命令行工具，推荐方式是直接下载打包好的 macOS 应用使用。
 
-- Tauri 2 (Rust backend)
-- React + TypeScript + Vite (frontend)
+## 核心功能
 
-## Features
+- 自动扫描多来源 Skills（Claude/Codex/全局/项目目录 + `skills list --json`）
+- 文件夹变化自动检测，发现新 Skill 会自动加入列表
+- 支持收藏 Skill，菜单栏下拉仅展示收藏项，点击即可复制 Skill 路径
+- 右侧详情展示关键信息：所属分类、安装时间、分类目录、技能路径、定义文件、常用命令、原始描述
+- 一键刷新、后台任务执行（刷新/测试连接/AI 总结均不阻塞界面）
+- 每个 Skill 支持单独“重新总结”
 
-- Multi-source skill scanning (Claude/Codex/global/project paths and `skills list --json`)
-- Auto-detect filesystem changes (no polling loop)
-- Optional AI summaries with DeepSeek:
-  - one-line summary
-  - detailed summary
-- Favorites + tray menu quick access
-- Per-skill "resummarize" action
-- Clipboard helpers for paths and commands
+## AI 总结与翻译（重点）
 
-## AI Key
+你只需要两步：
 
-DeepSeek key is user-provided and stored locally at:
+1. 去 DeepSeek 申请一个 API Key
+2. 在应用设置里填入 Key 并测试通过
 
-- `~/.opcsoskills/config.json`
+之后就可以使用 AI 自动总结功能，把英文 Skill 的用途和使用方式转成更易懂的中文说明，再也不怕看不懂。
 
-The key is never hardcoded in source.
+- 新发现的 Skill 可自动触发 AI 总结
+- 也可手动一键总结全部未总结项
+- Key 仅保存在本机：`~/.opcsoskills/config.json`
+- 源码不内置任何平台密钥
 
-## Development
+## 开源与安全
 
-Requirements:
+- CI：`.github/workflows/ci.yml`
+- 安全说明：`SECURITY.md`
+- 已包含基础敏感信息扫描流程
 
-- Node.js 20+
-- Rust stable
-- Tauri system dependencies
+## 开发者（可选）
 
-Install and run:
+如果你需要参与开发：
 
 ```bash
 npm ci
 npm run tauri dev
 ```
 
-Build:
+构建前端：
 
 ```bash
 npm run build
 ```
 
-Backend check:
+检查 Rust 后端：
 
 ```bash
 cd src-tauri
 cargo check
 ```
-
-## Open Source Readiness
-
-- CI workflow included: `.github/workflows/ci.yml`
-- Security policy included: `SECURITY.md`
-- Basic secret scan in CI
-
-## License
-
-Add your preferred license file (`LICENSE`) before publishing.
