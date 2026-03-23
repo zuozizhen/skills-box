@@ -88,8 +88,56 @@ jobs:
         with:
           workspaces: src-tauri
 
-      - name: Build Tauri bundle
+      - name: Validate Apple signing secrets
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_API_KEY_P8_B64: ${{ secrets.APPLE_API_KEY_P8_B64 }}
+        run: |
+          missing=()
+          for key in APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_API_KEY APPLE_API_ISSUER APPLE_API_KEY_P8_B64; do
+            if [ -z "${!key}" ]; then
+              missing+=("$key")
+            fi
+          done
+
+          if [ "${#missing[@]}" -gt 0 ]; then
+            echo "Missing required GitHub Actions secrets for macOS signing/notarization:"
+            printf ' - %s\n' "${missing[@]}"
+            exit 1
+          fi
+
+      - name: Prepare App Store Connect API key file
+        env:
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_KEY_P8_B64: ${{ secrets.APPLE_API_KEY_P8_B64 }}
+        run: |
+          key_path="$RUNNER_TEMP/AuthKey_${APPLE_API_KEY}.p8"
+          printf '%s' "$APPLE_API_KEY_P8_B64" | openssl base64 -d -A > "$key_path"
+          echo "APPLE_API_KEY_PATH=$key_path" >> "$GITHUB_ENV"
+
+      - name: Build Tauri bundle (signed + notarized)
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_API_KEY_PATH: ${{ env.APPLE_API_KEY_PATH }}
         run: npm run tauri build
+
+      - name: Verify macOS app signature
+        run: |
+          app_path="$(find src-tauri/target/release/bundle/macos -maxdepth 1 -type d -name '*.app' | head -n 1)"
+          if [ -z "$app_path" ]; then
+            echo "No .app bundle found."
+            exit 1
+          fi
+          echo "Verifying app: $app_path"
+          codesign --verify --deep --strict --verbose=2 "$app_path"
+          spctl -a -t exec -vv "$app_path"
 
       - name: Upload artifacts to draft release
         env:
