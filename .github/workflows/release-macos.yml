@@ -1,0 +1,103 @@
+name: Release macOS
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  create-draft-release:
+    name: Create Draft Release
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
+    steps:
+      - name: Read tag
+        id: meta
+        run: echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+
+      - name: Create draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.meta.outputs.tag }}
+        run: |
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Draft or release for $TAG already exists, skip create."
+          else
+            gh release create "$TAG" \
+              --draft \
+              --title "skills-box $TAG" \
+              --notes "Automated release for $TAG"
+          fi
+
+  build-macos:
+    name: Build macOS (${{ matrix.label }})
+    needs: create-draft-release
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-13
+            label: Intel
+          - runner: macos-14
+            label: Apple-Silicon
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install Node dependencies
+        run: npm ci
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Build Tauri bundle
+        run: npm run tauri build
+
+      - name: Upload artifacts to draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.create-draft-release.outputs.tag }}
+        run: |
+          files="$(find src-tauri/target/release/bundle -type f \( -name '*.dmg' -o -name '*.app.tar.gz' -o -name '*.dmg.sig' -o -name '*.app.tar.gz.sig' \) -print)"
+          if [ -z "$files" ]; then
+            echo "No macOS bundle artifacts found."
+            exit 1
+          fi
+          echo "$files" | while IFS= read -r file; do
+            [ -z "$file" ] && continue
+            echo "Uploading: $file"
+            gh release upload "$TAG" "$file" --clobber
+          done
+
+  publish-release:
+    name: Publish Release
+    needs:
+      - create-draft-release
+      - build-macos
+    runs-on: ubuntu-latest
+    steps:
+      - name: Publish draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.create-draft-release.outputs.tag }}
+        run: gh release edit "$TAG" --draft=false --latest
