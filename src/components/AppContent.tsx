@@ -1,7 +1,10 @@
 import { invoke } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { openUrl } from '@tauri-apps/plugin-opener';
+import { useEffect, useMemo, useRef, useState, type MouseEvent } from 'react';
 import { Check, Copy, RefreshCcw, Search, Settings, Star } from 'lucide-react';
+import ReactMarkdown, { type Components } from 'react-markdown';
+import remarkGfm from 'remark-gfm';
 
 interface Skill {
   id: string;
@@ -9,6 +12,7 @@ interface Skill {
   sourceName: string;
   sourceUsage: string;
   sourceDescription: string;
+  sourceMarkdown: string;
   sourceCommands: string[];
   aiBrief: string;
   aiDetail: string;
@@ -123,6 +127,19 @@ function toFriendlyAiMessage(message: string, fallback: string): string {
   return fallback;
 }
 
+function truncateForSearch(input: string, maxChars: number): string {
+  const text = input.trim();
+  if (!text) {
+    return '';
+  }
+  return text.length <= maxChars ? text : text.slice(0, maxChars);
+}
+
+function isSafeExternalHref(href: string): boolean {
+  const lower = href.toLowerCase();
+  return lower.startsWith('http://') || lower.startsWith('https://') || lower.startsWith('mailto:');
+}
+
 export function AppContent() {
   const [platforms, setPlatforms] = useState<Platform[]>([]);
   const [searchQuery, setSearchQuery] = useState('');
@@ -144,16 +161,60 @@ export function AppContent() {
   const [savingKey, setSavingKey] = useState(false);
   const [testingKey, setTestingKey] = useState(false);
   const [summarizingAi, setSummarizingAi] = useState(false);
+  const [resummarizingAllAi, setResummarizingAllAi] = useState(false);
+  const [resummarizingAllProgressText, setResummarizingAllProgressText] = useState('');
+  const [resummarizingAllCurrentSkill, setResummarizingAllCurrentSkill] = useState('');
   const [resummarizingSkillKey, setResummarizingSkillKey] = useState('');
   const [settingsMessage, setSettingsMessage] = useState('');
   const [appVersion, setAppVersion] = useState('');
   const [checkingUpdate, setCheckingUpdate] = useState(false);
   const [updateMessage, setUpdateMessage] = useState('');
+  const [contentTab, setContentTab] = useState<'detail' | 'source'>('detail');
   const loadInFlightRef = useRef(false);
   const queuedForceRefreshRef = useRef(false);
   const manualRefreshActiveRef = useRef(false);
   const manualRefreshStartedAtRef = useRef(0);
+  const copiedResetTimerRef = useRef<number | null>(null);
+  const resummarizeProgressResetTimerRef = useRef<number | null>(null);
   const [debouncedSearchQuery, setDebouncedSearchQuery] = useState('');
+
+  const markdownComponents = useMemo<Components>(
+    () => ({
+      a: ({ href, children, ...props }) => {
+        const target = typeof href === 'string' ? href.trim() : '';
+        if (!target) {
+          return <span>{children}</span>;
+        }
+
+        if (!isSafeExternalHref(target)) {
+          return (
+            <a href={target} {...props}>
+              {children}
+            </a>
+          );
+        }
+
+        const onClick = (event: MouseEvent<HTMLAnchorElement>) => {
+          event.preventDefault();
+          void openUrl(target).catch(() => {
+            window.open(target, '_blank', 'noopener,noreferrer');
+          });
+        };
+
+        return (
+          <a href={target} rel="noreferrer noopener" target="_blank" onClick={onClick} {...props}>
+            {children}
+          </a>
+        );
+      },
+      table: ({ children }) => (
+        <div className="markdown-table-wrap">
+          <table>{children}</table>
+        </div>
+      ),
+    }),
+    [],
+  );
 
   const allSkills = useMemo<FlatSkill[]>(
     () =>
@@ -165,7 +226,7 @@ export function AppContent() {
           platformName: platform.name,
           platformRoot: platform.root,
           searchText:
-            `${skill.name} ${skill.id} ${skill.aiBrief} ${skill.aiDetail} ${skill.sourceUsage} ${skill.sourceDescription} ${skill.path} ${platform.name}`.toLowerCase(),
+            `${skill.name} ${skill.id} ${truncateForSearch(skill.aiBrief, 160)} ${truncateForSearch(skill.aiDetail, 1200)} ${truncateForSearch(skill.sourceUsage, 420)} ${truncateForSearch(skill.sourceDescription, 420)} ${truncateForSearch(skill.sourceMarkdown, 1200)} ${skill.path} ${platform.name}`.toLowerCase(),
         })),
       ),
     [platforms],
@@ -210,7 +271,22 @@ export function AppContent() {
 
   useEffect(() => {
     setCopiedKey('');
+    setContentTab('detail');
   }, [selectedSkillKey]);
+
+  useEffect(
+    () => () => {
+      if (copiedResetTimerRef.current) {
+        window.clearTimeout(copiedResetTimerRef.current);
+        copiedResetTimerRef.current = null;
+      }
+      if (resummarizeProgressResetTimerRef.current) {
+        window.clearTimeout(resummarizeProgressResetTimerRef.current);
+        resummarizeProgressResetTimerRef.current = null;
+      }
+    },
+    [],
+  );
 
   const applySnapshot = (snapshot: SkillsSnapshot) => {
     setPlatforms(snapshot.platforms);
@@ -325,7 +401,48 @@ export function AppContent() {
     let unlisten: UnlistenFn | undefined;
     void listen<ScanProgressPayload>('scan_progress', (event) => {
       const payload = event.payload;
-      if (!payload || !manualRefreshActiveRef.current) {
+      if (!payload) {
+        return;
+      }
+
+      if (payload.stage === 'resummarize_all_start') {
+        setResummarizingAllProgressText(payload.message || '准备重新总结...');
+        setResummarizingAllCurrentSkill('');
+        return;
+      }
+      if (payload.stage === 'resummarize_all_progress') {
+        const total = Math.max(payload.summarizeTotal || 0, 1);
+        const step = Math.min(payload.summarizedCount + 1, total);
+        setResummarizingAllProgressText(`全部重新总结 ${step}/${total}`);
+        setResummarizingAllCurrentSkill(payload.currentSkill?.trim() || '');
+        return;
+      }
+      if (payload.stage === 'resummarize_all_done') {
+        setResummarizingAllProgressText(payload.message || '全部重新总结完成');
+        setResummarizingAllCurrentSkill('');
+        if (resummarizeProgressResetTimerRef.current) {
+          window.clearTimeout(resummarizeProgressResetTimerRef.current);
+          resummarizeProgressResetTimerRef.current = null;
+        }
+        resummarizeProgressResetTimerRef.current = window.setTimeout(() => {
+          setResummarizingAllProgressText((current) =>
+            current === (payload.message || '全部重新总结完成') ? '' : current,
+          );
+          resummarizeProgressResetTimerRef.current = null;
+        }, 3000);
+        return;
+      }
+      if (payload.stage === 'resummarize_all_warning') {
+        setResummarizingAllProgressText(payload.message || '预检失败，继续执行中...');
+        return;
+      }
+      if (payload.stage === 'resummarize_all_error') {
+        setResummarizingAllProgressText(payload.message || '全部重新总结失败');
+        setResummarizingAllCurrentSkill('');
+        return;
+      }
+
+      if (!manualRefreshActiveRef.current) {
         return;
       }
 
@@ -395,8 +512,13 @@ export function AppContent() {
       document.body.removeChild(textarea);
     }
     setCopiedKey(key);
-    window.setTimeout(() => {
+    if (copiedResetTimerRef.current) {
+      window.clearTimeout(copiedResetTimerRef.current);
+      copiedResetTimerRef.current = null;
+    }
+    copiedResetTimerRef.current = window.setTimeout(() => {
       setCopiedKey((current) => (current === key ? '' : current));
+      copiedResetTimerRef.current = null;
     }, 1400);
   };
 
@@ -496,6 +618,42 @@ export function AppContent() {
     }
   };
 
+  const resummarizeAllSkills = async () => {
+    setSettingsMessage('');
+    setError('');
+    setResummarizingAllProgressText('');
+    setResummarizingAllCurrentSkill('');
+
+    const confirmedFirst = window.confirm(
+      '将重新总结所有技能，这会覆盖现有 AI 总结内容。是否继续？',
+    );
+    if (!confirmedFirst) {
+      return;
+    }
+
+    const confirmedSecond = window.confirm(
+      '二次确认：此操作会让全部技能重新调用 AI，耗时较长且会消耗额度。确定继续吗？',
+    );
+    if (!confirmedSecond) {
+      return;
+    }
+
+    setResummarizingAllAi(true);
+    setResummarizingAllProgressText('准备重新总结...');
+    try {
+      const snapshot = await invoke<SkillsSnapshot>('resummarize_all_skills');
+      applySnapshot(snapshot);
+      setSettingsMessage('已完成全部重新总结。');
+    } catch (err) {
+      const raw = getInvokeErrorMessage(err, '');
+      setError(toFriendlyAiMessage(raw, raw || '全部重新总结失败，请稍后重试。'));
+      setResummarizingAllProgressText('');
+      setResummarizingAllCurrentSkill('');
+    } finally {
+      setResummarizingAllAi(false);
+    }
+  };
+
   const checkUpdates = async () => {
     setCheckingUpdate(true);
     setUpdateMessage('');
@@ -545,8 +703,8 @@ export function AppContent() {
 
   return (
     <div className="ui-panel flex h-full w-full flex-col overflow-hidden">
-      <div className="drag-region border-b border-[var(--line)] bg-[var(--panel-strong)] px-3 py-2">
-        <div className="no-drag flex items-center gap-2">
+      <div className="border-b border-[var(--line)] bg-[var(--panel-strong)] px-3 py-2">
+        <div className="flex items-center gap-2">
           <div className="flex h-8 flex-1 items-center rounded-md border border-[var(--line-strong)] bg-white px-2.5 md:max-w-[420px]">
             <Search className="mr-2 h-4 w-4 text-zinc-400" />
             <input
@@ -584,7 +742,7 @@ export function AppContent() {
           </div>
         </div>
         {showSettings && (
-          <div className="no-drag mt-2 border border-[var(--line)] bg-white px-4 py-3 text-sm text-zinc-800">
+          <div className="mt-2 border border-[var(--line)] bg-white px-4 py-3 text-sm text-zinc-800">
             <div className="grid grid-cols-[110px_1fr] gap-y-2">
               <div className="text-[13px] leading-6 text-zinc-500">DeepSeek Key</div>
               <div className="space-y-1">
@@ -641,7 +799,7 @@ export function AppContent() {
                   type="button"
                   onClick={() => void summarizePending()}
                   className="inline-flex h-7 items-center rounded border border-[var(--line-strong)] bg-white px-3 text-[12px] text-zinc-700 hover:bg-zinc-50 disabled:opacity-50"
-                  disabled={summarizingAi}
+                  disabled={summarizingAi || resummarizingAllAi}
                 >
                   {summarizingAi ? '总结中...' : 'AI 总结'}
                 </button>
@@ -661,7 +819,24 @@ export function AppContent() {
               <div className="text-[13px] leading-6 text-zinc-500">最近扫描</div>
               <div className="text-[13px] leading-6 text-zinc-800">{formatInstalledAt(scannedAt)}</div>
               <div className="text-[13px] leading-6 text-zinc-500">已 AI 总结</div>
-              <div className="text-[13px] leading-6 text-zinc-800">{aiSummarizedCount}</div>
+              <div className="flex flex-wrap items-center gap-2">
+                <div className="text-[13px] leading-6 text-zinc-800">{aiSummarizedCount}</div>
+                <button
+                  type="button"
+                  onClick={() => void resummarizeAllSkills()}
+                  className="inline-flex h-7 items-center rounded border border-[var(--line-strong)] bg-white px-3 text-[12px] text-zinc-700 hover:bg-zinc-50 disabled:opacity-50"
+                  disabled={resummarizingAllAi || summarizingAi}
+                  title="重新总结全部 skill（将覆盖现有 AI 总结）"
+                >
+                  {resummarizingAllAi ? '全部总结中...' : '全部重新总结'}
+                </button>
+                {resummarizingAllProgressText && (
+                  <div className="text-[12px] leading-6 text-zinc-500">
+                    {resummarizingAllProgressText}
+                    {resummarizingAllCurrentSkill ? ` · ${resummarizingAllCurrentSkill}` : ''}
+                  </div>
+                )}
+              </div>
               <div className="text-[13px] leading-6 text-zinc-500">未 AI 总结</div>
               <div className="text-[13px] leading-6 text-zinc-800">{aiPendingCount}</div>
             </div>
@@ -677,7 +852,7 @@ export function AppContent() {
             )}
           </div>
         )}
-        {error && <div className="no-drag mt-2 text-xs text-red-600">{error}</div>}
+        {error && <div className="mt-2 text-xs text-red-600">{error}</div>}
       </div>
 
       <div className="grid min-h-0 flex-1 md:grid-cols-[340px_minmax(0,1fr)]">
@@ -715,7 +890,7 @@ export function AppContent() {
                           </div>
                           <button
                             type="button"
-                            className="no-drag p-0 text-zinc-400 hover:text-zinc-800"
+                            className="p-0 text-zinc-400 hover:text-zinc-800"
                             onClick={(e) => {
                               e.stopPropagation();
                               void toggleFavorite(skill.platformId, skill.id, !skill.favorite);
@@ -777,30 +952,9 @@ export function AppContent() {
                 </div>
                 <div className="space-y-3 px-4 py-3">
                   <div className="grid grid-cols-[90px_1fr] gap-y-0 text-xs">
-                    <div className="leading-6 text-zinc-500">所属分类</div>
-                    <div className="leading-6 text-zinc-800">{selectedSkill.platformName}</div>
                     <div className="leading-6 text-zinc-500">安装时间</div>
                     <div className="leading-6 text-zinc-800">
                       {formatInstalledAt(selectedSkill.installedAt)}
-                    </div>
-
-                    <div className="leading-6 text-zinc-500">分类目录</div>
-                    <div className="grid grid-cols-[minmax(0,1fr)_auto] items-start gap-1.5">
-                      <div className="mono-ui break-all leading-6 text-zinc-700">
-                        {selectedSkill.platformRoot}
-                      </div>
-                      <button
-                        type="button"
-                        className="mt-1 rounded border border-[var(--line)] bg-white p-0.5 text-zinc-500 hover:text-zinc-800"
-                        onClick={() => void copyText('platformRoot', selectedSkill.platformRoot)}
-                        title="复制目录"
-                      >
-                        {copiedKey === 'platformRoot' ? (
-                          <Check className="h-3 w-3" />
-                        ) : (
-                          <Copy className="h-3 w-3" />
-                        )}
-                      </button>
                     </div>
 
                     <div className="leading-6 text-zinc-500">技能路径</div>
@@ -853,13 +1007,55 @@ export function AppContent() {
                   </div>
 
                   <div className="border-t border-[var(--line)] pt-3">
-                    <div className="mb-2 text-xs text-zinc-500">详细说明</div>
-                    <div className="whitespace-pre-wrap text-sm leading-6 text-zinc-800">
-                      {selectedSkill.aiDetail ||
-                        selectedSkill.sourceDescription ||
-                        selectedSkill.sourceUsage ||
-                        '该 skill 没有描述内容'}
+                    <div className="mb-2 flex items-center gap-1">
+                      <button
+                        type="button"
+                        className={[
+                          'rounded border px-2 py-1 text-xs',
+                          contentTab === 'detail'
+                            ? 'border-zinc-700 bg-zinc-900 text-white'
+                            : 'border-[var(--line)] bg-white text-zinc-600 hover:text-zinc-900',
+                        ].join(' ')}
+                        onClick={() => setContentTab('detail')}
+                      >
+                        AI总结
+                      </button>
+                      <button
+                        type="button"
+                        className={[
+                          'rounded border px-2 py-1 text-xs',
+                          contentTab === 'source'
+                            ? 'border-zinc-700 bg-zinc-900 text-white'
+                            : 'border-[var(--line)] bg-white text-zinc-600 hover:text-zinc-900',
+                        ].join(' ')}
+                        onClick={() => setContentTab('source')}
+                      >
+                        原始全文（SKILL.md）
+                      </button>
                     </div>
+                    {contentTab === 'detail' ? (
+                      <div className="markdown-skill markdown-pane rounded-md border border-[var(--line)] bg-white text-sm leading-7 text-zinc-700">
+                        <ReactMarkdown remarkPlugins={[remarkGfm]} components={markdownComponents}>
+                          {selectedSkill.aiDetail.trim()
+                            ? selectedSkill.aiDetail
+                            : selectedSkill.sourceDescription ||
+                              selectedSkill.sourceUsage ||
+                              '该 skill 没有描述内容'}
+                        </ReactMarkdown>
+                      </div>
+                    ) : selectedSkill.sourceMarkdown.trim() ? (
+                      <div className="markdown-skill markdown-pane rounded-md border border-[var(--line)] bg-white text-sm leading-7 text-zinc-700">
+                        <ReactMarkdown remarkPlugins={[remarkGfm]} components={markdownComponents}>
+                          {selectedSkill.sourceMarkdown}
+                        </ReactMarkdown>
+                      </div>
+                    ) : (
+                      <div className="whitespace-pre-wrap text-sm leading-6 text-zinc-700">
+                        {selectedSkill.sourceDescription ||
+                          selectedSkill.sourceUsage ||
+                          '该 skill 没有原始描述内容'}
+                      </div>
+                    )}
                   </div>
 
                   {selectedSkill.sourceCommands.length > 0 && (
@@ -902,14 +1098,9 @@ export function AppContent() {
                         </div>
                       </div>
                     )}
-
-                  <div className="border-t border-[var(--line)] pt-3">
-                    <div className="mb-2 text-xs text-zinc-500">原始描述（SKILL.md）</div>
-                    <div className="whitespace-pre-wrap text-sm leading-6 text-zinc-700">
-                      {selectedSkill.sourceDescription ||
-                        selectedSkill.sourceUsage ||
-                        '该 skill 没有原始描述内容'}
-                    </div>
+                  
+                  <div className="text-[11px] leading-5 text-zinc-400">
+                    默认展示“AI总结”，可切换查看 SKILL.md 原始全文。
                   </div>
                 </div>
               </>

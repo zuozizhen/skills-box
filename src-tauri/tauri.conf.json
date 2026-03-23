@@ -35,11 +35,7 @@
         "decorations": true,
         "transparent": false,
         "alwaysOnTop": false,
-        "hiddenTitle": true,
-        "trafficLightPosition": {
-          "x": 16,
-          "y": 16
-        },
+        "hiddenTitle": false,
         "skipTaskbar": false,
         "visible": false,
         "resizable": true

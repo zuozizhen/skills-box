@@ -18,7 +18,14 @@ const SKILL_FILE_NAMES: &[&str] = &["SKILL.md", "skill.md"];
 const DEEPSEEK_API_URL: &str = "https://api.deepseek.com/chat/completions";
 const GITHUB_LATEST_RELEASE_API_URL: &str =
     "https://api.github.com/repos/zuozizhen/skills-box/releases/latest";
+const GITHUB_RELEASES_API_URL: &str =
+    "https://api.github.com/repos/zuozizhen/skills-box/releases?per_page=20";
 const SNAPSHOT_CACHE_TTL_MS: i64 = 60_000;
+const AI_SOURCE_MARKDOWN_MAX_CHARS: usize = 24_000;
+const AI_RESPONSE_MAX_TOKENS: usize = 7500;
+const AI_REQUEST_TIMEOUT_SECS: u64 = 60;
+const AI_PROFILE_MAX_RETRY_ATTEMPTS: usize = 3;
+const AI_PROFILE_RETRY_BASE_DELAY_MS: u64 = 1_200;
 
 #[derive(Debug, Clone)]
 struct CachedSnapshot {
@@ -27,19 +34,24 @@ struct CachedSnapshot {
 }
 
 static SNAPSHOT_CACHE: LazyLock<Mutex<Option<CachedSnapshot>>> = LazyLock::new(|| Mutex::new(None));
+static AI_PROFILE_QUEUE_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+static AI_SUMMARY_JOB_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+static OVERRIDES_FILE_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+static APP_CONFIG_FILE_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+fn lock_ai_summary_job_queue() -> std::sync::MutexGuard<'static, ()> {
+    AI_SUMMARY_JOB_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "lowercase")]
 enum SkillStatus {
+    #[default]
     Active,
     Update,
     Draft,
-}
-
-impl Default for SkillStatus {
-    fn default() -> Self {
-        Self::Active
-    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -50,6 +62,7 @@ struct SkillData {
     source_name: String,
     source_usage: String,
     source_description: String,
+    source_markdown: String,
     source_commands: Vec<String>,
     ai_brief: String,
     ai_detail: String,
@@ -155,6 +168,13 @@ struct ResummarizeSkillPayload {
     skill_id: String,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TraySkillPayload {
+    platform_id: String,
+    skill_id: String,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct AiSettingsStatus {
@@ -171,11 +191,29 @@ struct UpdateCheckResult {
     release_url: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TrayFavoriteSkill {
+    platform_id: String,
+    skill_id: String,
+    name: String,
+    summary: String,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct GithubLatestRelease {
     tag_name: String,
     html_url: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GithubReleaseEntry {
+    tag_name: String,
+    html_url: Option<String>,
+    #[serde(default)]
+    draft: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -238,7 +276,27 @@ fn override_key(platform_id: &str, skill_id: &str) -> String {
     format!("{platform_id}::{skill_id}")
 }
 
+fn write_text_atomic(path: &Path, contents: &str) -> io::Result<()> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent)?;
+    let file_name = path.file_name().and_then(|name| name.to_str()).unwrap_or("data");
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    let temp_path = parent.join(format!(".{file_name}.tmp-{}-{stamp}", std::process::id()));
+    fs::write(&temp_path, contents)?;
+    if let Err(err) = fs::rename(&temp_path, path) {
+        let _ = fs::remove_file(&temp_path);
+        return Err(err);
+    }
+    Ok(())
+}
+
 fn load_overrides() -> OverridesStore {
+    let _guard = OVERRIDES_FILE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let Some(path) = overrides_file_path() else {
         return OverridesStore::default();
     };
@@ -249,21 +307,24 @@ fn load_overrides() -> OverridesStore {
 }
 
 fn save_overrides(store: &OverridesStore) -> io::Result<()> {
+    let _guard = OVERRIDES_FILE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let Some(path) = overrides_file_path() else {
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
             "HOME is not available for persistence",
         ));
     };
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
     let contents = serde_json::to_string_pretty(store)
         .map_err(|err| io::Error::other(format!("serialize overrides failed: {err}")))?;
-    fs::write(path, contents)
+    write_text_atomic(&path, &contents)
 }
 
 fn load_app_config() -> AppConfig {
+    let _guard = APP_CONFIG_FILE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let Some(path) = app_config_file_path() else {
         return AppConfig::default();
     };
@@ -274,18 +335,18 @@ fn load_app_config() -> AppConfig {
 }
 
 fn save_app_config(config: &AppConfig) -> io::Result<()> {
+    let _guard = APP_CONFIG_FILE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let Some(path) = app_config_file_path() else {
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
             "HOME is not available for persistence",
         ));
     };
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
     let contents = serde_json::to_string_pretty(config)
         .map_err(|err| io::Error::other(format!("serialize app config failed: {err}")))?;
-    fs::write(path, contents)
+    write_text_atomic(&path, &contents)
 }
 
 fn is_hidden(name: &str) -> bool {
@@ -849,6 +910,39 @@ fn humanize_identifier(input: &str) -> String {
     normalize_spaces(&output)
 }
 
+fn take_chars(input: &str, max_chars: usize) -> String {
+    if input.chars().count() <= max_chars {
+        return input.to_string();
+    }
+    input.chars().take(max_chars).collect()
+}
+
+fn strip_frontmatter_markdown(contents: &str) -> String {
+    let normalized = contents.replace("\r\n", "\n").replace('\r', "\n");
+    let lines: Vec<&str> = normalized.lines().collect();
+    if lines.is_empty() {
+        return String::new();
+    }
+    if lines[0].trim() != "---" {
+        return normalized.trim().to_string();
+    }
+
+    for (index, line) in lines.iter().enumerate().skip(1) {
+        if line.trim() != "---" {
+            continue;
+        }
+        let body = lines
+            .iter()
+            .skip(index + 1)
+            .copied()
+            .collect::<Vec<_>>()
+            .join("\n");
+        return body.trim().to_string();
+    }
+
+    normalized.trim().to_string()
+}
+
 fn parse_frontmatter_description(contents: &str) -> Option<String> {
     let mut lines = contents.lines();
     if lines.next()?.trim() != "---" {
@@ -1130,8 +1224,42 @@ fn deepseek_api_key_mask() -> Option<String> {
     resolve_deepseek_api_key().and_then(|resolved| masked_key(&resolved.value))
 }
 
-fn trim_ai_text(input: &str) -> String {
+fn trim_ai_brief(input: &str) -> String {
     normalize_spaces(input).trim().to_string()
+}
+
+fn unwrap_markdown_fence(input: &str) -> String {
+    let trimmed = input.trim();
+    if !trimmed.starts_with("```") {
+        return trimmed.to_string();
+    }
+
+    let mut lines = trimmed.lines();
+    let Some(first_line) = lines.next() else {
+        return String::new();
+    };
+    if !first_line.trim_start().starts_with("```") {
+        return trimmed.to_string();
+    }
+
+    let mut body: Vec<&str> = lines.collect();
+    if body.last().is_some_and(|line| line.trim() == "```") {
+        body.pop();
+    }
+    body.join("\n").trim().to_string()
+}
+
+fn trim_ai_markdown(input: &str) -> String {
+    let unfenced = unwrap_markdown_fence(input);
+    unfenced
+        .replace("\r\n", "\n")
+        .replace('\r', "\n")
+        .lines()
+        .map(|line| line.trim_end())
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim()
+        .to_string()
 }
 
 fn parse_ai_profile_text(text: &str) -> Option<AiSkillProfile> {
@@ -1227,10 +1355,16 @@ fn extract_deepseek_content(text: &str) -> Result<String, String> {
 fn build_ai_prompt(platform_name: &str, skill: &SkillData) -> String {
     let source_description = skill.source_description.trim();
     let source_usage = skill.source_usage.trim();
+    let source_markdown = skill.source_markdown.trim();
     let commands = if skill.source_commands.is_empty() {
         vec!["(none)".to_string()]
     } else {
         skill.source_commands.clone()
+    };
+    let source_markdown_for_prompt = if source_markdown.is_empty() {
+        String::new()
+    } else {
+        take_chars(source_markdown, AI_SOURCE_MARKDOWN_MAX_CHARS)
     };
 
     let payload = serde_json::json!({
@@ -1241,15 +1375,50 @@ fn build_ai_prompt(platform_name: &str, skill: &SkillData) -> String {
         "source_usage": source_usage,
         "source_commands": commands,
         "skill_path": skill.path,
+        "source_markdown_truncated_chars": AI_SOURCE_MARKDOWN_MAX_CHARS,
     });
 
     format!(
-        "请基于下面的技能元数据生成中文说明，目标读者是普通用户（非技术背景）。\n\n数据:\n{}\n\n输出要求:\n1) 严格输出 JSON: {{\"brief\":\"...\",\"detail\":\"...\"}}\n2) brief: 1 句话，16-28 字，直接说明“这个技能能帮我做什么”，不用空话，不用术语堆砌。\n3) detail: 2-3 句，90-180 字，按“做什么 -> 什么时候用 -> 怎么开始（结合已有命令/用法）”组织。\n4) 禁止编造输入里没有的能力；信息不足时要保守描述。\n5) 保留关键英文专有名词（如框架名、命令名），其余使用自然中文。",
-        payload
+        "请基于下面的技能元数据和 SKILL.md 全文，生成“专业但易懂”的中文说明，目标是让用户快速上手并理解边界。\n\n元数据(JSON):\n{}\n\nSKILL.md 全文（可能已截断）:\n~~~markdown\n{}\n~~~\n\n输出要求:\n1) 严格输出 JSON: {{\"brief\":\"...\",\"detail\":\"...\"}}\n2) brief: 1 句话，16-32 字，直说核心价值，不要口号。\n3) detail: 必须是 Markdown，内容尽可能详尽、结构化、专业，建议使用以下二级标题（若信息不足可合并，但不要省略关键点）：\n   - ## 核心能力\n   - ## 适用场景\n   - ## 输入与输出\n   - ## 快速开始\n   - ## 常用命令与操作\n   - ## 注意事项与边界\n   - ## 常见问题与排查\n4) detail 要求：\n   - 先讲清“做什么”，再讲“何时用”，最后讲“怎么用”\n   - 步骤可执行，尽量具体到首个命令/入口\n   - 对参数、前置条件、失败场景给出明确提示\n   - 若文档有命令，必须整理成可直接复制的代码块\n5) 严禁编造输入里没有的能力；信息缺失时明确写“文档未提供”。\n6) 保留关键英文专有名词（框架名、命令名、API 字段名），其余用自然中文。\n7) 不要输出与该技能无关的背景知识，不要空泛。",
+        payload, source_markdown_for_prompt
     )
 }
 
-fn call_deepseek_profile(
+fn should_retry_deepseek_error(message: &str) -> bool {
+    let lower = message.to_lowercase();
+    if lower.contains("http 401")
+        || lower.contains("http 400")
+        || lower.contains("http 403")
+        || lower.contains("http 404")
+        || lower.contains("invalid api key")
+        || lower.contains("unauthorized")
+        || lower.contains("forbidden")
+    {
+        return false;
+    }
+
+    lower.contains("http 408")
+        || lower.contains("http 409")
+        || lower.contains("http 429")
+        || lower.contains("http 500")
+        || lower.contains("http 502")
+        || lower.contains("http 503")
+        || lower.contains("http 504")
+        || lower.contains("timeout")
+        || lower.contains("timed out")
+        || lower.contains("network")
+        || lower.contains("connection")
+        || lower.contains("dns")
+        || lower.contains("temporarily")
+        || lower.contains("请求失败")
+        || lower.contains("连接失败")
+        || lower.contains("响应解析失败")
+        || lower.contains("格式解析失败")
+        || lower.contains("响应缺少")
+        || lower.contains("内容为空")
+}
+
+fn call_deepseek_profile_once(
     platform_name: &str,
     skill: &SkillData,
     api_key: &str,
@@ -1259,12 +1428,12 @@ fn call_deepseek_profile(
     let body = serde_json::json!({
         "model": "deepseek-chat",
         "temperature": 0.1,
-        "max_tokens": 520,
+        "max_tokens": AI_RESPONSE_MAX_TOKENS,
         "response_format": { "type": "json_object" },
         "messages": [
             {
                 "role": "system",
-                "content": "你是“技能说明编辑器”。你的职责是把技能元数据改写成准确、易懂、可执行的中文说明。必须忠于输入，不臆测，不输出 Markdown，不输出多余字段。只返回 JSON。"
+                "content": "你是“技能说明编辑器”。你要输出专业、准确、可执行、结构清晰的中文技能文档。必须忠于输入，不臆测，不输出多余字段。只返回 JSON，其中 detail 字段使用 Markdown。"
             },
             {
                 "role": "user",
@@ -1273,19 +1442,55 @@ fn call_deepseek_profile(
         ]
     });
 
-    let text = deepseek_post(api_key, &body, Duration::from_secs(20))?;
+    let text = deepseek_post(api_key, &body, Duration::from_secs(AI_REQUEST_TIMEOUT_SECS))?;
     let content = extract_deepseek_content(&text)?;
 
     let profile =
         parse_ai_profile_text(&content).ok_or_else(|| "AI 描述格式解析失败".to_string())?;
-    let brief = trim_ai_text(&profile.brief);
-    let detail = trim_ai_text(&profile.detail);
+    let brief = trim_ai_brief(&profile.brief);
+    let detail = trim_ai_markdown(&profile.detail);
 
     if brief.is_empty() || detail.is_empty() {
         return Err("AI 描述内容为空".to_string());
     }
 
     Ok(AiSkillProfile { brief, detail })
+}
+
+fn call_deepseek_profile(
+    platform_name: &str,
+    skill: &SkillData,
+    api_key: &str,
+) -> Result<AiSkillProfile, String> {
+    let _queue_guard = AI_PROFILE_QUEUE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+    let max_retries = AI_PROFILE_MAX_RETRY_ATTEMPTS.saturating_sub(1);
+    let mut retried = 0usize;
+    let mut last_error = String::new();
+
+    for attempt in 1..=AI_PROFILE_MAX_RETRY_ATTEMPTS {
+        match call_deepseek_profile_once(platform_name, skill, api_key) {
+            Ok(profile) => return Ok(profile),
+            Err(err) => {
+                last_error = err.clone();
+                let is_last_attempt = attempt >= AI_PROFILE_MAX_RETRY_ATTEMPTS;
+                if is_last_attempt || !should_retry_deepseek_error(&err) {
+                    return Err(format!("{err}（重试 {retried}/{max_retries}）"));
+                }
+
+                retried += 1;
+                let exp = (attempt - 1).min(6) as u32;
+                let delay_ms = AI_PROFILE_RETRY_BASE_DELAY_MS.saturating_mul(1u64 << exp);
+                thread::sleep(Duration::from_millis(delay_ms));
+            }
+        }
+    }
+
+    Err(format!(
+        "{last_error}（重试 {retried}/{max_retries}）"
+    ))
 }
 
 fn build_deepseek_test_skill() -> SkillData {
@@ -1295,6 +1500,8 @@ fn build_deepseek_test_skill() -> SkillData {
         source_name: "DeepSeek 连通测试".to_string(),
         source_usage: "用于验证当前 Key 是否可用于技能总结。".to_string(),
         source_description: "这是一个仅用于连通性和响应格式校验的测试技能。".to_string(),
+        source_markdown: "# DeepSeek 连通测试\n\n这是一个仅用于连通性和响应格式校验的测试技能。"
+            .to_string(),
         source_commands: vec!["npx skills list".to_string()],
         ai_brief: String::new(),
         ai_detail: String::new(),
@@ -1324,7 +1531,10 @@ fn enrich_missing_ai_profiles(
             if !skill.ai_brief.trim().is_empty() && !skill.ai_detail.trim().is_empty() {
                 continue;
             }
-            if skill.source_description.trim().is_empty() && skill.source_usage.trim().is_empty() {
+            if skill.source_description.trim().is_empty()
+                && skill.source_usage.trim().is_empty()
+                && skill.source_markdown.trim().is_empty()
+            {
                 continue;
             }
 
@@ -1410,6 +1620,7 @@ struct ParsedSkillMeta {
     source_name: String,
     source_usage: String,
     source_description: String,
+    source_markdown: String,
     source_commands: Vec<String>,
 }
 
@@ -1421,6 +1632,7 @@ fn parse_skill_meta(file_path: &Path, fallback: &str) -> ParsedSkillMeta {
             source_name,
             source_usage,
             source_description: String::new(),
+            source_markdown: String::new(),
             source_commands: vec![],
         };
     };
@@ -1431,6 +1643,7 @@ fn parse_skill_meta(file_path: &Path, fallback: &str) -> ParsedSkillMeta {
     let description = parse_frontmatter_description(&contents)
         .or_else(|| parse_first_paragraph(&contents))
         .unwrap_or_default();
+    let source_markdown = strip_frontmatter_markdown(&contents);
     let commands = extract_command_lines(&contents);
     let source_usage = build_source_usage(&description, &commands, fallback);
 
@@ -1438,6 +1651,7 @@ fn parse_skill_meta(file_path: &Path, fallback: &str) -> ParsedSkillMeta {
         source_name,
         source_usage,
         source_description: description,
+        source_markdown,
         source_commands: commands,
     }
 }
@@ -1540,6 +1754,7 @@ fn discover_skills_for_platform(
                     source_name: meta.source_name,
                     source_usage: meta.source_usage,
                     source_description: meta.source_description,
+                    source_markdown: meta.source_markdown,
                     source_commands: meta.source_commands,
                     ai_brief,
                     ai_detail,
@@ -1589,6 +1804,7 @@ fn discover_skills_for_platform(
                 source_name: meta.source_name,
                 source_usage: meta.source_usage,
                 source_description: meta.source_description,
+                source_markdown: meta.source_markdown,
                 source_commands: meta.source_commands,
                 ai_brief,
                 ai_detail,
@@ -1644,20 +1860,57 @@ fn discover_skills_from_skills_cli(
 
         let key = override_key(platform_id, &skill_id);
         let override_entry = overrides.entries.get(&key);
+        let path_ref = Path::new(&path);
+        let parsed_meta = if path_ref.is_dir() {
+            find_skill_definition_file(path_ref).map(|file| parse_skill_meta(&file, &skill_id))
+        } else if path_ref.is_file() {
+            Some(parse_skill_meta(path_ref, &skill_id))
+        } else {
+            None
+        };
         let source_name = if entry.name.trim().is_empty() {
-            let fallback = Path::new(&path)
-                .file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or("skill");
-            humanize_identifier(fallback)
+            parsed_meta
+                .as_ref()
+                .map(|meta| meta.source_name.clone())
+                .unwrap_or_else(|| {
+                    let fallback = Path::new(&path)
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .unwrap_or("skill");
+                    humanize_identifier(fallback)
+                })
         } else {
             entry.name.trim().to_string()
         };
         let name = source_name.clone();
-        let source_usage = format!(
-            "Use {} according to its SKILL.md instructions in {}.",
-            source_name, path
-        );
+        let source_usage = parsed_meta
+            .as_ref()
+            .map(|meta| meta.source_usage.clone())
+            .unwrap_or_else(|| {
+                format!(
+                    "Use {} according to its SKILL.md instructions in {}.",
+                    source_name, path
+                )
+            });
+        let source_description = parsed_meta
+            .as_ref()
+            .map(|meta| meta.source_description.clone())
+            .unwrap_or_default();
+        let source_markdown = parsed_meta
+            .as_ref()
+            .map(|meta| meta.source_markdown.clone())
+            .unwrap_or_default();
+        let source_commands = parsed_meta
+            .as_ref()
+            .map(|meta| meta.source_commands.clone())
+            .unwrap_or_default();
+        let definition_path = if path_ref.is_dir() {
+            find_skill_definition_file(path_ref)
+                .map(|file| file.to_string_lossy().to_string())
+                .unwrap_or_else(|| path.clone())
+        } else {
+            path.clone()
+        };
         let status = override_entry
             .and_then(|entry| entry.status)
             .unwrap_or_default();
@@ -1678,13 +1931,14 @@ fn discover_skills_from_skills_cli(
             name,
             source_name,
             source_usage,
-            source_description: String::new(),
-            source_commands: vec![],
+            source_description,
+            source_markdown,
+            source_commands,
             ai_brief,
             ai_detail,
             favorite,
             status,
-            definition_path: path.clone(),
+            definition_path,
             path,
             installed_at,
             first_seen_at,
@@ -1820,8 +2074,8 @@ fn skill_keys(snapshot: &SkillsSnapshot) -> HashSet<String> {
         .collect()
 }
 
-fn emit_scan_progress(
-    app: &tauri::AppHandle,
+fn emit_scan_progress<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
     stage: &str,
     message: String,
     new_skills_count: usize,
@@ -1840,16 +2094,20 @@ fn emit_scan_progress(
     let _ = app.emit("scan_progress", payload);
 }
 
-fn emit_skills_snapshot(app: &tauri::AppHandle, snapshot: &SkillsSnapshot) {
+fn emit_skills_snapshot<R: tauri::Runtime>(app: &tauri::AppHandle<R>, snapshot: &SkillsSnapshot) {
     let _ = app.emit("skills_snapshot_updated", snapshot.clone());
 }
 
-fn check_for_updates_internal(current_version: String) -> Result<UpdateCheckResult, String> {
-    let client = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(12))
-        .build()
-        .map_err(|err| format!("检查更新初始化失败: {err}"))?;
+fn map_update_http_error(code: u16) -> String {
+    match code {
+        403 | 429 => "检查更新过于频繁，请稍后再试".to_string(),
+        _ => format!("更新服务暂时不可用 (HTTP {code})"),
+    }
+}
 
+fn fetch_latest_release(
+    client: &reqwest::blocking::Client,
+) -> Result<Option<GithubLatestRelease>, String> {
     let response = client
         .get(GITHUB_LATEST_RELEASE_API_URL)
         .header(reqwest::header::USER_AGENT, "skills-box")
@@ -1862,19 +2120,65 @@ fn check_for_updates_internal(current_version: String) -> Result<UpdateCheckResu
         .text()
         .map_err(|err| format!("检查更新响应读取失败: {err}"))?;
 
-    if !status.is_success() {
-        let code = status.as_u16();
-        let message = match code {
-            403 | 429 => "检查更新过于频繁，请稍后再试".to_string(),
-            _ => format!("更新服务暂时不可用 (HTTP {code})"),
-        };
-        return Err(message);
+    if status.is_success() {
+        let release: GithubLatestRelease = serde_json::from_str(&body)
+            .map_err(|_| "更新信息解析失败，请稍后重试".to_string())?;
+        return Ok(Some(release));
     }
 
-    let release: GithubLatestRelease =
+    if status.as_u16() != 404 {
+        return Err(map_update_http_error(status.as_u16()));
+    }
+
+    let response = client
+        .get(GITHUB_RELEASES_API_URL)
+        .header(reqwest::header::USER_AGENT, "skills-box")
+        .header(reqwest::header::ACCEPT, "application/vnd.github+json")
+        .send()
+        .map_err(|err| format!("检查更新请求失败: {err}"))?;
+
+    let status = response.status();
+    let body = response
+        .text()
+        .map_err(|err| format!("检查更新响应读取失败: {err}"))?;
+
+    if !status.is_success() {
+        if status.as_u16() == 404 {
+            return Ok(None);
+        }
+        return Err(map_update_http_error(status.as_u16()));
+    }
+
+    let releases: Vec<GithubReleaseEntry> =
         serde_json::from_str(&body).map_err(|_| "更新信息解析失败，请稍后重试".to_string())?;
 
+    let latest = releases
+        .into_iter()
+        .find(|release| !release.draft)
+        .map(|release| GithubLatestRelease {
+            tag_name: release.tag_name,
+            html_url: release.html_url,
+        });
+
+    Ok(latest)
+}
+
+fn check_for_updates_internal(current_version: String) -> Result<UpdateCheckResult, String> {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(12))
+        .build()
+        .map_err(|err| format!("检查更新初始化失败: {err}"))?;
+
     let current_clean = normalize_version_value(&current_version);
+    let Some(release) = fetch_latest_release(&client)? else {
+        return Ok(UpdateCheckResult {
+            current_version: current_clean.clone(),
+            latest_version: current_clean,
+            has_update: false,
+            release_url: None,
+        });
+    };
+
     let latest_clean = normalize_version_value(&release.tag_name);
     if latest_clean.is_empty() {
         return Err("未获取到有效版本信息，请稍后重试".to_string());
@@ -2047,9 +2351,7 @@ fn apply_update_to_cached_snapshot(payload: &UpdateSkillPayload) -> Option<Skill
     let mut cache = SNAPSHOT_CACHE
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let Some(entry) = cache.as_mut() else {
-        return None;
-    };
+    let entry = cache.as_mut()?;
 
     let mut updated = false;
     for platform in &mut entry.snapshot.platforms {
@@ -2084,104 +2386,12 @@ fn apply_update_to_cached_snapshot(payload: &UpdateSkillPayload) -> Option<Skill
 
 fn build_tray_menu<R: tauri::Runtime, M: Manager<R>>(
     manager: &M,
-    snapshot: &SkillsSnapshot,
 ) -> tauri::Result<Menu<R>> {
     let menu = Menu::new(manager)?;
-    let total_skills = snapshot.total_skills();
-    let favorite_count: usize = snapshot
-        .platforms
-        .iter()
-        .flat_map(|platform| platform.skills.iter())
-        .filter(|skill| skill.favorite)
-        .count();
-
-    let dashboard_item =
-        MenuItem::with_id(manager, "open_dashboard", "Dashboard", true, None::<&str>)?;
-    let title = MenuItem::with_id(
-        manager,
-        "title",
-        format!("Skills Box ({favorite_count}/{total_skills})"),
-        false,
-        None::<&str>,
-    )?;
-    let summary = MenuItem::with_id(
-        manager,
-        "summary",
-        "点击下面 skill 复制技能路径",
-        false,
-        None::<&str>,
-    )?;
-    let top_separator_after_dashboard = PredefinedMenuItem::separator(manager)?;
-    let top_separator_after_summary = PredefinedMenuItem::separator(manager)?;
-    menu.append_items(&[
-        &dashboard_item,
-        &top_separator_after_dashboard,
-        &title,
-        &summary,
-        &top_separator_after_summary,
-    ])?;
-
-    let mut favorite_platforms = Vec::new();
-    for platform in &snapshot.platforms {
-        let favorite_skills: Vec<_> = platform
-            .skills
-            .iter()
-            .filter(|skill| skill.favorite)
-            .collect();
-        if favorite_skills.is_empty() {
-            continue;
-        }
-        favorite_platforms.push((platform, favorite_skills));
-    }
-
-    if favorite_platforms.is_empty() {
-        let empty = MenuItem::with_id(
-            manager,
-            "favorites_empty",
-            "暂无收藏（在 Dashboard 点击星标）",
-            false,
-            None::<&str>,
-        )?;
-        menu.append(&empty)?;
-    }
-
-    for (index, (platform, favorite_skills)) in favorite_platforms.iter().enumerate() {
-        let header = MenuItem::with_id(
-            manager,
-            format!("platform::{}", platform.id),
-            format!("{} ({})", platform.name, favorite_skills.len()),
-            false,
-            None::<&str>,
-        )?;
-        menu.append(&header)?;
-
-        for skill in favorite_skills {
-            let label = if skill.name != skill.source_name {
-                format!("  {} ({} -> {})", skill.id, skill.source_name, skill.name)
-            } else if skill.source_name != skill.id {
-                format!("  {} ({})", skill.id, skill.source_name)
-            } else {
-                format!("  {}", skill.id)
-            };
-            let item = MenuItem::with_id(
-                manager,
-                format!("skill::{}::{}", platform.id, skill.id),
-                label,
-                true,
-                None::<&str>,
-            )?;
-            menu.append(&item)?;
-        }
-
-        if index + 1 != favorite_platforms.len() {
-            let separator = PredefinedMenuItem::separator(manager)?;
-            menu.append(&separator)?;
-        }
-    }
-
+    let dashboard_item = MenuItem::with_id(manager, "open_dashboard", "Dashboard", true, None::<&str>)?;
     let bottom_separator = PredefinedMenuItem::separator(manager)?;
     let quit_i = MenuItem::with_id(manager, "quit", "Quit", true, None::<&str>)?;
-    menu.append_items(&[&bottom_separator, &quit_i])?;
+    menu.append_items(&[&dashboard_item, &bottom_separator, &quit_i])?;
 
     Ok(menu)
 }
@@ -2205,13 +2415,85 @@ fn copy_text_to_clipboard(text: &str) -> Result<(), String> {
 
 fn set_tray_menu_from_snapshot<R: tauri::Runtime>(
     app: &tauri::AppHandle<R>,
-    snapshot: &SkillsSnapshot,
+    _snapshot: &SkillsSnapshot,
 ) {
-    let Ok(menu) = build_tray_menu(app, snapshot) else {
+    let Ok(menu) = build_tray_menu(app) else {
         return;
     };
     if let Some(tray) = app.tray_by_id("main") {
         let _ = tray.set_menu(Some(menu));
+    }
+}
+
+fn list_tray_favorites_internal() -> Vec<TrayFavoriteSkill> {
+    let snapshot = load_skills_snapshot_internal(false, false);
+    let mut favorites = Vec::<TrayFavoriteSkill>::new();
+
+    for platform in &snapshot.platforms {
+        for skill in &platform.skills {
+            if !skill.favorite {
+                continue;
+            }
+
+            let summary = if !skill.ai_brief.trim().is_empty() {
+                skill.ai_brief.trim().to_string()
+            } else if !skill.source_description.trim().is_empty() {
+                skill.source_description.trim().to_string()
+            } else if !skill.source_usage.trim().is_empty() {
+                skill.source_usage.trim().to_string()
+            } else {
+                "暂无一句话总结".to_string()
+            };
+
+            favorites.push(TrayFavoriteSkill {
+                platform_id: platform.id.clone(),
+                skill_id: skill.id.clone(),
+                name: skill.name.clone(),
+                summary,
+            });
+        }
+    }
+
+    favorites.sort_by(|left, right| {
+        left.name
+            .to_lowercase()
+            .cmp(&right.name.to_lowercase())
+            .then_with(|| left.skill_id.to_lowercase().cmp(&right.skill_id.to_lowercase()))
+    });
+    favorites
+}
+
+fn open_tray_panel<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
+    if let Some(window) = app.get_webview_window("tray_panel") {
+        if window.is_visible().unwrap_or(false) {
+            let _ = window.hide();
+            return;
+        }
+        let _ = window.show();
+        let _ = window.unminimize();
+        let _ = window.set_focus();
+        return;
+    }
+
+    let mut builder = WebviewWindowBuilder::new(app, "tray_panel", WebviewUrl::default())
+        .title("Skills Box")
+        .inner_size(420.0, 560.0)
+        .min_inner_size(360.0, 420.0)
+        .resizable(true)
+        .visible(true)
+        .always_on_top(true)
+        .skip_taskbar(true)
+        .center();
+
+    #[cfg(target_os = "macos")]
+    {
+        builder = builder
+            .hidden_title(true)
+            .traffic_light_position(tauri::LogicalPosition::new(14.0, 14.0));
+    }
+
+    if let Ok(window) = builder.build() {
+        let _ = window.set_focus();
     }
 }
 
@@ -2245,6 +2527,8 @@ fn open_dashboard<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
 }
 
 fn refresh_skills_with_auto_ai_internal(app: tauri::AppHandle) -> SkillsSnapshot {
+    let _job_queue_guard = lock_ai_summary_job_queue();
+
     emit_scan_progress(
         &app,
         "scanning",
@@ -2446,6 +2730,38 @@ fn get_app_version(app: tauri::AppHandle) -> String {
 }
 
 #[tauri::command]
+fn get_window_label(window: tauri::Window) -> String {
+    window.label().to_string()
+}
+
+#[tauri::command]
+fn list_tray_favorites() -> Vec<TrayFavoriteSkill> {
+    list_tray_favorites_internal()
+}
+
+#[tauri::command]
+fn copy_skill_path_for_tray(payload: TraySkillPayload) -> Result<String, String> {
+    let snapshot = load_skills_snapshot_internal(false, false);
+    let Some(path) = find_skill_path(&snapshot, &payload.platform_id, &payload.skill_id) else {
+        return Err("未找到对应技能路径".to_string());
+    };
+    copy_text_to_clipboard(&path)?;
+    Ok(path)
+}
+
+#[tauri::command]
+fn open_dashboard_window(app: tauri::AppHandle) {
+    open_dashboard(&app);
+}
+
+#[tauri::command]
+fn hide_tray_panel_window(app: tauri::AppHandle) {
+    if let Some(window) = app.get_webview_window("tray_panel") {
+        let _ = window.hide();
+    }
+}
+
+#[tauri::command]
 async fn check_for_updates(app: tauri::AppHandle) -> Result<UpdateCheckResult, String> {
     let current_version = app.package_info().version.to_string();
     tauri::async_runtime::spawn_blocking(move || check_for_updates_internal(current_version))
@@ -2507,6 +2823,7 @@ async fn test_deepseek_api_key() -> Result<String, String> {
 async fn summarize_pending_skills(app: tauri::AppHandle) -> Result<SkillsSnapshot, String> {
     let app_for_task = app.clone();
     let result = tauri::async_runtime::spawn_blocking(move || {
+        let _job_queue_guard = lock_ai_summary_job_queue();
         let api_key =
             deepseek_api_key().ok_or_else(|| "请先在设置中填写 DeepSeek Key".to_string())?;
         test_deepseek_api_key_request(&api_key)?;
@@ -2520,7 +2837,162 @@ async fn summarize_pending_skills(app: tauri::AppHandle) -> Result<SkillsSnapsho
     Ok(result)
 }
 
+fn resummarize_all_skills_internal<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+) -> Result<SkillsSnapshot, String> {
+    let _job_queue_guard = lock_ai_summary_job_queue();
+    let api_key = deepseek_api_key().ok_or_else(|| "请先在设置中填写 DeepSeek Key".to_string())?;
+
+    let mut snapshot = load_skills_snapshot_internal(true, false);
+    let mut targets = Vec::<(usize, usize, String)>::new();
+    for (platform_index, platform) in snapshot.platforms.iter().enumerate() {
+        for (skill_index, skill) in platform.skills.iter().enumerate() {
+            if skill.source_description.trim().is_empty()
+                && skill.source_usage.trim().is_empty()
+                && skill.source_markdown.trim().is_empty()
+            {
+                continue;
+            }
+            targets.push((platform_index, skill_index, skill.name.clone()));
+        }
+    }
+
+    let summarize_total = targets.len();
+    emit_scan_progress(
+        &app,
+        "resummarize_all_start",
+        format!("准备重新总结 {summarize_total} 个 skill。"),
+        0,
+        0,
+        summarize_total,
+        None,
+    );
+    if summarize_total == 0 {
+        emit_scan_progress(
+            &app,
+            "resummarize_all_done",
+            "没有可重新总结的 skill。".to_string(),
+            0,
+            0,
+            0,
+            None,
+        );
+        return Ok(snapshot);
+    }
+
+    if let Err(err) = test_deepseek_api_key_request(&api_key) {
+        emit_scan_progress(
+            &app,
+            "resummarize_all_warning",
+            format!("连通性预检失败，仍继续执行：{err}"),
+            0,
+            0,
+            summarize_total,
+            None,
+        );
+    }
+
+    let mut overrides = load_overrides();
+    let mut changed = false;
+    let mut summarized_count = 0usize;
+    let mut failed_count = 0usize;
+    let mut first_error: Option<String> = None;
+
+    for (index, (platform_index, skill_index, skill_name)) in targets.iter().enumerate() {
+        emit_scan_progress(
+            &app,
+            "resummarize_all_progress",
+            format!(
+                "正在重新总结 {}/{}：{}",
+                index + 1,
+                summarize_total,
+                skill_name
+            ),
+            0,
+            summarized_count,
+            summarize_total,
+            Some(skill_name.clone()),
+        );
+
+        let platform_name = snapshot.platforms[*platform_index].name.clone();
+        let platform_id = snapshot.platforms[*platform_index].id.clone();
+        let skill_id = snapshot.platforms[*platform_index].skills[*skill_index].id.clone();
+        let skill_for_ai = snapshot.platforms[*platform_index].skills[*skill_index].clone();
+
+        let profile = match call_deepseek_profile(&platform_name, &skill_for_ai, &api_key) {
+            Ok(profile) => profile,
+            Err(err) => {
+                failed_count += 1;
+                if first_error.is_none() {
+                    first_error = Some(err.clone());
+                }
+                emit_scan_progress(
+                    &app,
+                    "resummarize_all_progress",
+                    format!("总结失败：{skill_name}（{err}）"),
+                    0,
+                    summarized_count,
+                    summarize_total,
+                    Some(skill_name.clone()),
+                );
+                continue;
+            }
+        };
+
+        let skill = &mut snapshot.platforms[*platform_index].skills[*skill_index];
+        skill.ai_brief = profile.brief.clone();
+        skill.ai_detail = profile.detail.clone();
+
+        let key = override_key(&platform_id, &skill_id);
+        let entry = overrides.entries.entry(key).or_default();
+        entry.ai_brief = Some(profile.brief);
+        entry.ai_detail = Some(profile.detail);
+        summarized_count += 1;
+        changed = true;
+    }
+
+    if changed {
+        save_overrides(&overrides).map_err(|err| format!("保存技能设置失败: {err}"))?;
+    }
+
+    snapshot.ai_summarized_count = snapshot.ai_summarized_count();
+    snapshot.ai_pending_count = snapshot.ai_pending_count();
+    write_snapshot_cache(&snapshot);
+
+    if summarized_count == 0 && failed_count > 0 {
+        let error_message = first_error
+            .unwrap_or_else(|| "全部请求失败，未拿到可用结果".to_string());
+        let final_message = format!(
+            "全部重新总结失败：成功 0/{summarize_total}，失败 {failed_count}。首个错误：{error_message}"
+        );
+        emit_scan_progress(
+            &app,
+            "resummarize_all_error",
+            final_message.clone(),
+            0,
+            summarized_count,
+            summarize_total,
+            None,
+        );
+        return Err(final_message);
+    }
+
+    emit_scan_progress(
+        &app,
+        "resummarize_all_done",
+        format!(
+            "全部重新总结完成：成功 {summarized_count}/{summarize_total}，失败 {failed_count}。"
+        ),
+        0,
+        summarized_count,
+        summarize_total,
+        None,
+    );
+    Ok(snapshot)
+}
+
 fn resummarize_skill_internal(payload: ResummarizeSkillPayload) -> Result<SkillsSnapshot, String> {
+    let _job_queue_guard = lock_ai_summary_job_queue();
     let api_key = deepseek_api_key().ok_or_else(|| "请先在设置中填写 DeepSeek Key".to_string())?;
 
     let mut snapshot = load_skills_snapshot_internal(false, false);
@@ -2596,6 +3068,21 @@ async fn resummarize_skill(
 }
 
 #[tauri::command]
+async fn resummarize_all_skills(app: tauri::AppHandle) -> Result<SkillsSnapshot, String> {
+    let app_for_job = app.clone();
+    let app_for_task = app.clone();
+    let snapshot = tauri::async_runtime::spawn_blocking(move || {
+        resummarize_all_skills_internal(app_for_job)
+    })
+        .await
+        .unwrap_or_else(|err| Err(format!("后台任务失败: {err}")))?;
+
+    set_tray_menu_from_snapshot(&app_for_task, &snapshot);
+    emit_skills_snapshot(&app_for_task, &snapshot);
+    Ok(snapshot)
+}
+
+#[tauri::command]
 fn update_skill(
     app: tauri::AppHandle,
     payload: UpdateSkillPayload,
@@ -2642,13 +3129,19 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .setup(|app| {
             let snapshot = load_skills_snapshot_internal(true, false);
-            let menu = build_tray_menu(app, &snapshot)?;
+            let tray_menu = build_tray_menu(app)?;
             let app_handle = app.handle().clone();
+            
+            // Build the main application menu
+            let default_menu = Menu::default(app.handle())?;
+            app.set_menu(default_menu)?;
+
+            let tray_icon = tauri::image::Image::from_bytes(include_bytes!("../icons/tray/36x36.png"))?;
 
             TrayIconBuilder::with_id("main")
-                .icon(app.default_window_icon().unwrap().clone())
+                .icon(tray_icon)
                 .icon_as_template(true)
-                .menu(&menu)
+                .menu(&tray_menu)
                 .show_menu_on_left_click(true)
                 .on_menu_event(|app, event| match event.id.as_ref() {
                     "open_dashboard" => {
@@ -2657,6 +3150,10 @@ pub fn run() {
                     "quit" => {
                         app.exit(0);
                     }
+                    id if id == "tray_title"
+                        || id == "tray_hint"
+                        || id == "favorites_empty"
+                        || id.starts_with("skill_note::") => {}
                     id if id.starts_with("skill::") => {
                         let mut parts = id.splitn(3, "::");
                         let _ = parts.next();
@@ -2674,6 +3171,7 @@ pub fn run() {
                     _ => {}
                 })
                 .build(app)?;
+
             start_filesystem_watcher(app_handle);
 
             Ok(())
@@ -2689,7 +3187,8 @@ pub fn run() {
             set_deepseek_api_key,
             test_deepseek_api_key,
             summarize_pending_skills,
-            resummarize_skill
+            resummarize_skill,
+            resummarize_all_skills
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
