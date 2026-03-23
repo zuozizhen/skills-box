@@ -54,27 +54,3 @@ npm run build
 cd src-tauri
 cargo check
 ```
-
-## 维护者发布（macOS 自动构建）
-
-本项目已配置好 tag 驱动的自动发布流程。
-
-本地执行：
-
-```bash
-npm run release 1.2.0
-```
-
-这个命令会自动完成：
-
-1. 同步更新 `package.json`、`package-lock.json`、`src-tauri/Cargo.toml`、`src-tauri/tauri.conf.json` 的版本号
-2. 执行构建检查（前端构建 + Rust `cargo check`）
-3. 自动 `git commit`
-4. 自动打 tag（`v1.2.0`）
-5. 自动推送分支和 tag
-
-GitHub 收到 tag 后，`release-macos.yml` 会自动执行：
-
-1. 创建 Draft Release
-2. 构建 macOS Intel + Apple Silicon 安装包并上传（`.dmg` / `.app.tar.gz`）
-3. 将 Draft Release 自动发布为公开版本
