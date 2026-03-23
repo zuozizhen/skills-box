@@ -16,6 +16,8 @@ use tauri::{
 
 const SKILL_FILE_NAMES: &[&str] = &["SKILL.md", "skill.md"];
 const DEEPSEEK_API_URL: &str = "https://api.deepseek.com/chat/completions";
+const GITHUB_LATEST_RELEASE_API_URL: &str =
+    "https://api.github.com/repos/zuozizhen/skills-box/releases/latest";
 const SNAPSHOT_CACHE_TTL_MS: i64 = 60_000;
 
 #[derive(Debug, Clone)]
@@ -160,6 +162,22 @@ struct AiSettingsStatus {
     masked_key: Option<String>,
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct UpdateCheckResult {
+    current_version: String,
+    latest_version: String,
+    has_update: bool,
+    release_url: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GithubLatestRelease {
+    tag_name: String,
+    html_url: Option<String>,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 struct AiSkillProfile {
     brief: String,
@@ -210,6 +228,10 @@ fn overrides_file_path() -> Option<PathBuf> {
 
 fn app_config_file_path() -> Option<PathBuf> {
     home_dir().map(|home| home.join(".opcsoskills").join("config.json"))
+}
+
+fn normalize_version_value(input: &str) -> String {
+    input.trim().trim_start_matches('v').trim().to_string()
 }
 
 fn override_key(platform_id: &str, skill_id: &str) -> String {
@@ -1822,6 +1844,58 @@ fn emit_skills_snapshot(app: &tauri::AppHandle, snapshot: &SkillsSnapshot) {
     let _ = app.emit("skills_snapshot_updated", snapshot.clone());
 }
 
+fn check_for_updates_internal(current_version: String) -> Result<UpdateCheckResult, String> {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(12))
+        .build()
+        .map_err(|err| format!("检查更新初始化失败: {err}"))?;
+
+    let response = client
+        .get(GITHUB_LATEST_RELEASE_API_URL)
+        .header(reqwest::header::USER_AGENT, "skills-box")
+        .header(reqwest::header::ACCEPT, "application/vnd.github+json")
+        .send()
+        .map_err(|err| format!("检查更新请求失败: {err}"))?;
+
+    let status = response.status();
+    let body = response
+        .text()
+        .map_err(|err| format!("检查更新响应读取失败: {err}"))?;
+
+    if !status.is_success() {
+        let code = status.as_u16();
+        let message = match code {
+            403 | 429 => "检查更新过于频繁，请稍后再试".to_string(),
+            _ => format!("更新服务暂时不可用 (HTTP {code})"),
+        };
+        return Err(message);
+    }
+
+    let release: GithubLatestRelease = serde_json::from_str(&body)
+        .map_err(|_| "更新信息解析失败，请稍后重试".to_string())?;
+
+    let current_clean = normalize_version_value(&current_version);
+    let latest_clean = normalize_version_value(&release.tag_name);
+    if latest_clean.is_empty() {
+        return Err("未获取到有效版本信息，请稍后重试".to_string());
+    }
+
+    let has_update = match (
+        semver::Version::parse(&latest_clean),
+        semver::Version::parse(&current_clean),
+    ) {
+        (Ok(latest), Ok(current)) => latest > current,
+        _ => latest_clean != current_clean,
+    };
+
+    Ok(UpdateCheckResult {
+        current_version: current_clean,
+        latest_version: latest_clean,
+        has_update,
+        release_url: release.html_url,
+    })
+}
+
 fn should_process_notify_event(event: &notify::Event) -> bool {
     !matches!(event.kind, notify::EventKind::Access(_))
 }
@@ -2365,6 +2439,19 @@ fn get_ai_settings_status() -> AiSettingsStatus {
 }
 
 #[tauri::command]
+fn get_app_version(app: tauri::AppHandle) -> String {
+    app.package_info().version.to_string()
+}
+
+#[tauri::command]
+async fn check_for_updates(app: tauri::AppHandle) -> Result<UpdateCheckResult, String> {
+    let current_version = app.package_info().version.to_string();
+    tauri::async_runtime::spawn_blocking(move || check_for_updates_internal(current_version))
+        .await
+        .unwrap_or_else(|err| Err(format!("后台任务失败: {err}")))
+}
+
+#[tauri::command]
 async fn set_deepseek_api_key(api_key: String) -> Result<AiSettingsStatus, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let value = api_key.trim().to_string();
@@ -2594,6 +2681,8 @@ pub fn run() {
             refresh_skills_with_auto_ai,
             update_skill,
             get_ai_settings_status,
+            get_app_version,
+            check_for_updates,
             set_deepseek_api_key,
             test_deepseek_api_key,
             summarize_pending_skills,

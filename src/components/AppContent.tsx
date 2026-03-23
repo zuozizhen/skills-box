@@ -38,6 +38,13 @@ interface AiSettingsStatus {
   maskedKey?: string | null;
 }
 
+interface UpdateCheckResult {
+  currentVersion: string;
+  latestVersion: string;
+  hasUpdate: boolean;
+  releaseUrl?: string | null;
+}
+
 interface FlatSkill extends Skill {
   key: string;
   platformId: string;
@@ -139,6 +146,9 @@ export function AppContent() {
   const [summarizingAi, setSummarizingAi] = useState(false);
   const [resummarizingSkillKey, setResummarizingSkillKey] = useState('');
   const [settingsMessage, setSettingsMessage] = useState('');
+  const [appVersion, setAppVersion] = useState('');
+  const [checkingUpdate, setCheckingUpdate] = useState(false);
+  const [updateMessage, setUpdateMessage] = useState('');
   const loadInFlightRef = useRef(false);
   const queuedForceRefreshRef = useRef(false);
   const manualRefreshActiveRef = useRef(false);
@@ -296,9 +306,19 @@ export function AppContent() {
     }
   };
 
+  const loadAppVersion = async () => {
+    try {
+      const version = await invoke<string>('get_app_version');
+      setAppVersion(version.trim());
+    } catch {
+      setAppVersion('');
+    }
+  };
+
   useEffect(() => {
     void loadSkills({ initial: true });
     void loadAiSettings();
+    void loadAppVersion();
   }, []);
 
   useEffect(() => {
@@ -476,6 +496,34 @@ export function AppContent() {
     }
   };
 
+  const checkUpdates = async () => {
+    setCheckingUpdate(true);
+    setUpdateMessage('');
+    setError('');
+    try {
+      const result = await invoke<UpdateCheckResult>('check_for_updates');
+      const current = result.currentVersion?.trim() || appVersion || '-';
+      if (current && current !== '-') {
+        setAppVersion(current);
+      }
+
+      if (result.hasUpdate) {
+        const link = result.releaseUrl?.trim();
+        setUpdateMessage(
+          link
+            ? `发现新版本 ${result.latestVersion}（当前 ${current}）。下载：${link}`
+            : `发现新版本 ${result.latestVersion}（当前 ${current}）。`,
+        );
+      } else {
+        setUpdateMessage(`当前已是最新版本（${current}）。`);
+      }
+    } catch (err) {
+      setError(getInvokeErrorMessage(err, '检查更新失败，请稍后重试。'));
+    } finally {
+      setCheckingUpdate(false);
+    }
+  };
+
   const resummarizeSkill = async (skill: FlatSkill) => {
     setError('');
     setResummarizingSkillKey(skill.key);
@@ -598,6 +646,18 @@ export function AppContent() {
                   {summarizingAi ? '总结中...' : 'AI 总结'}
                 </button>
               </div>
+              <div className="text-[13px] leading-6 text-zinc-500">当前版本</div>
+              <div className="flex flex-wrap items-center gap-2">
+                <div className="text-[13px] leading-6 text-zinc-800">{appVersion || '-'}</div>
+                <button
+                  type="button"
+                  onClick={() => void checkUpdates()}
+                  className="inline-flex h-7 items-center rounded border border-[var(--line-strong)] bg-white px-3 text-[12px] text-zinc-700 hover:bg-zinc-50 disabled:opacity-50"
+                  disabled={checkingUpdate}
+                >
+                  {checkingUpdate ? '检查中...' : '检查更新'}
+                </button>
+              </div>
               <div className="text-[13px] leading-6 text-zinc-500">最近扫描</div>
               <div className="text-[13px] leading-6 text-zinc-800">{formatInstalledAt(scannedAt)}</div>
               <div className="text-[13px] leading-6 text-zinc-500">已 AI 总结</div>
@@ -608,6 +668,11 @@ export function AppContent() {
             {settingsMessage && (
               <div className="mt-2 rounded border border-emerald-200 bg-emerald-50 px-2 py-1 text-[12px] font-medium leading-6 text-emerald-700">
                 {settingsMessage}
+              </div>
+            )}
+            {updateMessage && (
+              <div className="mt-2 rounded border border-sky-200 bg-sky-50 px-2 py-1 text-[12px] leading-6 text-sky-700">
+                {updateMessage}
               </div>
             )}
           </div>
