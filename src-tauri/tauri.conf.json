@@ -1,0 +1,63 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "skills-box",
+  "version": "0.1.0",
+  "identifier": "com.zuozizhen.skillsbox",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "npm run build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "macOSPrivateApi": true,
+    "windows": [
+      {
+        "label": "main",
+        "title": "Skills Box",
+        "width": 320,
+        "height": 550,
+        "decorations": false,
+        "transparent": true,
+        "alwaysOnTop": true,
+        "hiddenTitle": true,
+        "skipTaskbar": true,
+        "visible": false,
+        "resizable": false
+      },
+      {
+        "label": "dashboard",
+        "title": "Skills Box Dashboard",
+        "width": 1024,
+        "height": 740,
+        "minWidth": 860,
+        "minHeight": 600,
+        "decorations": true,
+        "transparent": false,
+        "alwaysOnTop": false,
+        "hiddenTitle": true,
+        "trafficLightPosition": {
+          "x": 16,
+          "y": 16
+        },
+        "skipTaskbar": false,
+        "visible": false,
+        "resizable": true
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ]
+  }
+}

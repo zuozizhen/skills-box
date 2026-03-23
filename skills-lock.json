@@ -1,0 +1,15 @@
+{
+  "version": 1,
+  "skills": {
+    "ai-image-generation": {
+      "source": "inferen-sh/skills",
+      "sourceType": "github",
+      "computedHash": "e45c0ee94791e67e355130109fd827bd8b4bd0fb1d6b2ff8f782eb566d435174"
+    },
+    "microsoft-foundry": {
+      "source": "microsoft/azure-skills",
+      "sourceType": "github",
+      "computedHash": "a08f7455ee7ef3c9fd6de1d5b6479f06ecbe68fcb04de8f9dd4aca000849202e"
+    }
+  }
+}
