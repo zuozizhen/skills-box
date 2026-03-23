@@ -4,6 +4,8 @@
 
 这不是给最终用户 `npm` 安装的命令行工具，推荐方式是直接下载打包好的 macOS 应用使用。
 
+![skills-box 应用预览](public/skills-box-show.png)
+
 ## 核心功能
 
 - 自动扫描多来源 Skills（Claude/Codex/全局/项目目录 + `skills list --json`）
