@@ -65,8 +65,6 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - runner: macos-13
-            label: Intel
           - runner: macos-14
             label: Apple-Silicon
     steps:
