@@ -1517,6 +1517,24 @@ fn extract_deepseek_content(text: &str) -> Result<String, String> {
         .ok_or_else(|| "DeepSeek 响应缺少 content".to_string())
 }
 
+fn load_skill_markdown_for_ai(skill: &SkillData) -> String {
+    let definition_path = skill.definition_path.trim();
+    if !definition_path.is_empty() {
+        let path = Path::new(definition_path);
+        if path.is_file() {
+            if let Ok(contents) = fs::read_to_string(path) {
+                let normalized = contents.replace("\r\n", "\n").replace('\r', "\n");
+                let trimmed = normalized.trim();
+                if !trimmed.is_empty() {
+                    return trimmed.to_string();
+                }
+            }
+        }
+    }
+
+    skill.source_markdown.trim().to_string()
+}
+
 fn build_ai_prompt(
     platform_name: &str,
     skill: &SkillData,
@@ -1524,7 +1542,15 @@ fn build_ai_prompt(
 ) -> String {
     let source_description = skill.source_description.trim();
     let source_usage = skill.source_usage.trim();
-    let source_markdown = skill.source_markdown.trim();
+    let source_markdown_full = load_skill_markdown_for_ai(skill);
+    let source_markdown = source_markdown_full.trim();
+    let frontmatter_description =
+        parse_frontmatter_description(source_markdown).unwrap_or_default();
+    let description_for_prompt = if !frontmatter_description.trim().is_empty() {
+        frontmatter_description.trim().to_string()
+    } else {
+        source_description.to_string()
+    };
     let commands = if skill.source_commands.is_empty() {
         vec!["(none)".to_string()]
     } else {
@@ -1540,7 +1566,9 @@ fn build_ai_prompt(
         "platform": platform_name,
         "skill_id": skill.id,
         "skill_name": skill.source_name,
+        "description": description_for_prompt,
         "source_description": source_description,
+        "frontmatter_description": frontmatter_description,
         "source_usage": source_usage,
         "source_commands": commands,
         "skill_path": skill.path,
@@ -1548,7 +1576,7 @@ fn build_ai_prompt(
     });
 
     format!(
-        "请基于下面的技能元数据和 SKILL.md 全文，生成“精炼、易懂、重点明确”的中文说明。\n\n元数据(JSON):\n{}\n\nSKILL.md 全文（可能已截断）:\n~~~markdown\n{}\n~~~\n\n输出要求:\n1) 严格输出 JSON: {{\"brief\":\"...\",\"detail\":\"...\"}}，字段顺序必须先 brief，再 detail。\n2) brief: 1 句话，16-30 字，直说核心价值，不要口号。\n3) detail: 必须是 Markdown，仅保留这两个二级标题（按顺序输出）：\n   - ## 什么时候用\n   - ## 怎么用\n4) detail 写作约束：\n   - 突出重点，不要废话，不要背景铺垫\n   - 总长度建议 400-900 字\n   - “什么时候用”写清典型场景、触发条件、不适用边界\n   - “怎么用”写清最短可执行步骤、关键参数/输入输出、常见失败处理\n   - 有命令就给可直接复制的代码块\n   - 严禁编造输入里没有的能力；信息缺失时写“文档未提供”\n   - 不要输出“注意事项与边界”章节\n5) 保留关键英文专有名词（框架名、命令名、API 字段名），其余用自然中文。",
+        "请基于下面的技能元数据和 SKILL.md 全文，生成“精炼、易懂、重点明确”的中文说明。\n注意：元数据中的 description（尤其 frontmatter_description）用于描述 skill 的用途与适用场景，这是最高优先级依据。\n\n元数据(JSON):\n{}\n\nSKILL.md 全文（包含可能存在的 YAML frontmatter，且可能已截断）:\n~~~markdown\n{}\n~~~\n\n输出要求:\n1) 严格输出 JSON: {{\"brief\":\"...\",\"detail\":\"...\"}}，字段顺序必须先 brief，再 detail。\n2) brief: 1 句话，16-30 字，直说核心价值，不要口号。\n3) detail: 必须是 Markdown，仅保留这两个二级标题（按顺序输出）：\n   - ## 什么时候用\n   - ## 具体功能\n4) detail 写作约束：\n   - 突出重点，不要废话，不要背景铺垫\n   - 总长度建议 400-900 字\n   - “什么时候用”必须优先结合 description，写清典型场景、触发条件、不适用边界\n   - “具体功能”按功能点分条，写清每个功能能做什么、关键输入输出、必要命令/参数\n   - 有命令就给可直接复制的代码块\n   - 严禁编造输入里没有的能力；信息缺失时写“文档未提供”\n   - 不要输出“注意事项与边界”章节\n5) 保留关键英文专有名词（框架名、命令名、API 字段名），其余用自然中文。",
         payload, source_markdown_for_prompt
     )
 }
