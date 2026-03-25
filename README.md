@@ -6,10 +6,6 @@ SkillsBox 是一个面向普通用户的 macOS 桌面应用，用来查看、管
 
 ![SkillsBox 主界面](docs/screenshots/skills-box-main.png)
 
-![SkillsBox 总结详情](docs/screenshots/skills-box-summary.png)
-
-![SkillsBox 设置页](docs/screenshots/skills-box-settings.png)
-
 ## 核心功能
 
 ### 1. 多来源自动发现与实时同步
@@ -62,6 +58,8 @@ SkillsBox 提供独立下载入口，统一从发布页获取安装包。
 
 1. 去 [DeepSeek 开放平台](https://platform.deepseek.com/api_keys) 申请一个 API Key。
 2. 在 SkillsBox 设置里填入 Key 并测试通过。
+
+![SkillsBox DeepSeek 设置](docs/screenshots/skills-box-settings.png)
 
 ## 本地开发运行
 
