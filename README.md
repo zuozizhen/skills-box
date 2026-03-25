@@ -2,7 +2,13 @@
 
 SkillsBox 是一个面向普通用户的 macOS 桌面应用，用来查看、管理和理解你安装的各类 AI Skills。
 
-![SkillsBox 应用预览](public/skills-box-show.png)
+## 界面预览
+
+![SkillsBox 主界面](docs/screenshots/skills-box-main.png)
+
+![SkillsBox 总结详情](docs/screenshots/skills-box-summary.png)
+
+![SkillsBox 设置页](docs/screenshots/skills-box-settings.png)
 
 ## 核心功能
 
