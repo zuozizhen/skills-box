@@ -22,7 +22,7 @@ Please include:
 
 - Do not commit API keys, tokens, or local config files.
 - This project stores user DeepSeek key locally in:
-  - `~/.opcsoskills/config.json`
+  - `~/.skillsbox/config.json`
 - Before opening a PR:
   - Check staged files for secrets
   - Confirm `.env*`, local config, and build artifacts are not tracked

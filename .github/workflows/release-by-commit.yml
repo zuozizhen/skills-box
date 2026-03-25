@@ -5,6 +5,10 @@ on:
     branches:
       - main
       - master
+    paths-ignore:
+      - "**/*.md"
+      - "docs/**"
+      - "public/skills-box-show.png"
 
 permissions:
   contents: write

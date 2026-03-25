@@ -5,7 +5,15 @@ on:
     branches:
       - main
       - master
+    paths-ignore:
+      - "**/*.md"
+      - "docs/**"
+      - "public/skills-box-show.png"
   pull_request:
+    paths-ignore:
+      - "**/*.md"
+      - "docs/**"
+      - "public/skills-box-show.png"
 
 jobs:
   build-and-check:

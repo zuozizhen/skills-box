@@ -1,9 +1,5 @@
 # SkillsBox
 
-<p align="center">
-  <img src="src-tauri/icons/icon.png" alt="SkillsBox Logo" width="96" />
-</p>
-
 SkillsBox 是一个面向普通用户的 macOS 桌面应用，用来查看、管理和理解你安装的各类 AI Skills。
 
 ![SkillsBox 应用预览](public/skills-box-show.png)

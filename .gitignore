@@ -33,3 +33,10 @@ src-tauri/gen/
 *.njsproj
 *.sln
 *.sw?
+
+# Local certificate/key temp files
+*.p8
+*.p12
+*.p8.b64
+*.p12.b64
+AuthKey_*.p8

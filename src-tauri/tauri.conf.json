@@ -27,15 +27,15 @@
       },
       {
         "label": "dashboard",
-        "title": "Skills Box Dashboard",
+        "title": "",
         "width": 1024,
-        "height": 740,
+        "height": 820,
         "minWidth": 860,
-        "minHeight": 600,
+        "minHeight": 640,
         "decorations": true,
         "transparent": false,
         "alwaysOnTop": false,
-        "hiddenTitle": false,
+        "hiddenTitle": true,
         "skipTaskbar": false,
         "visible": false,
         "resizable": true
@@ -47,6 +47,7 @@
   },
   "bundle": {
     "active": true,
+    "createUpdaterArtifacts": true,
     "targets": [
       "app",
       "dmg"
@@ -58,5 +59,13 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ]
+  },
+  "plugins": {
+    "updater": {
+      "endpoints": [
+        "https://github.com/zuozizhen/skills-box/releases/latest/download/latest.json"
+      ],
+      "pubkey": "__TAURI_UPDATER_PUBKEY__"
+    }
   }
 }

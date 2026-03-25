@@ -23,6 +23,25 @@ body {
   overflow: hidden;
 }
 
+button {
+  transition:
+    background-color 0.14s ease,
+    color 0.14s ease,
+    border-color 0.14s ease;
+}
+
+button:not(:disabled) {
+  cursor: pointer;
+}
+
+button:not(:disabled):hover {
+  background-color: #f4f4f5;
+}
+
+button.no-hover-btn:hover {
+  background-color: inherit;
+}
+
 .custom-scrollbar::-webkit-scrollbar {
   width: 6px;
 }
@@ -71,4 +90,151 @@ body {
 
 .mono-ui {
   font-family: var(--font-mono);
+}
+
+.markdown-pane {
+  padding: 1.1rem 1.25rem 1.2rem;
+}
+
+.markdown-pane p {
+  line-height: 1.8;
+}
+
+.markdown-skill :first-child {
+  margin-top: 0;
+}
+
+.markdown-skill :last-child {
+  margin-bottom: 0;
+}
+
+.markdown-skill h1,
+.markdown-skill h2,
+.markdown-skill h3,
+.markdown-skill h4,
+.markdown-skill h5,
+.markdown-skill h6 {
+  margin: 1.35rem 0 0.6rem;
+  color: #0f172a;
+  font-weight: 600;
+  line-height: 1.5;
+  letter-spacing: 0.01em;
+}
+
+.markdown-skill h1 {
+  font-size: 1.16rem;
+}
+
+.markdown-skill h2 {
+  font-size: 1.08rem;
+}
+
+.markdown-skill h3,
+.markdown-skill h4,
+.markdown-skill h5,
+.markdown-skill h6 {
+  font-size: 1rem;
+}
+
+.markdown-skill p,
+.markdown-skill ul,
+.markdown-skill ol,
+.markdown-skill pre,
+.markdown-skill blockquote,
+.markdown-skill table {
+  margin: 0.7rem 0;
+}
+
+.markdown-skill ul,
+.markdown-skill ol {
+  padding-left: 1.4rem;
+}
+
+.markdown-skill li + li {
+  margin-top: 0.28rem;
+}
+
+.markdown-skill ul {
+  list-style-type: disc;
+  list-style-position: outside;
+}
+
+.markdown-skill ul ul {
+  list-style-type: circle;
+}
+
+.markdown-skill ol {
+  list-style-type: decimal;
+  list-style-position: outside;
+}
+
+.markdown-skill ol ol {
+  list-style-type: lower-alpha;
+}
+
+.markdown-skill li::marker {
+  color: #52525b;
+}
+
+.markdown-skill code {
+  font-family: var(--font-mono);
+  font-size: 0.79rem;
+  background: #f4f4f5;
+  border: 1px solid #e4e4e7;
+  border-radius: 0.3rem;
+  padding: 0.08rem 0.34rem;
+}
+
+.markdown-skill pre {
+  overflow-x: auto;
+  background: #f8fafc;
+  border: 1px solid #e4e4e7;
+  border-radius: 0.5rem;
+  padding: 0.75rem 0.85rem;
+}
+
+.markdown-skill pre code {
+  background: transparent;
+  border: none;
+  border-radius: 0;
+  padding: 0;
+  font-size: 0.77rem;
+}
+
+.markdown-skill a {
+  color: #0369a1;
+  text-decoration: underline;
+  word-break: break-all;
+}
+
+.markdown-skill blockquote {
+  border-left: 3px solid #cbd5e1;
+  margin-left: 0;
+  padding-left: 0.85rem;
+  color: #52525b;
+}
+
+.markdown-skill table {
+  border-collapse: collapse;
+  width: 100%;
+  font-size: 0.9rem;
+  background: #fff;
+}
+
+.markdown-table-wrap {
+  width: 100%;
+  overflow-x: auto;
+}
+
+.markdown-skill th,
+.markdown-skill td {
+  border: 1px solid #d4d4d8;
+  padding: 0.48rem 0.56rem;
+  text-align: left;
+  vertical-align: top;
+}
+
+.markdown-skill thead th {
+  background: #f8fafc;
+  font-weight: 600;
 }

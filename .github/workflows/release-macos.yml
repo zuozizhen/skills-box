@@ -95,9 +95,11 @@ jobs:
           APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
           APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
           APPLE_API_KEY_P8_B64: ${{ secrets.APPLE_API_KEY_P8_B64 }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_UPDATER_PUBKEY: ${{ secrets.TAURI_UPDATER_PUBKEY }}
         run: |
           missing=()
-          for key in APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_API_KEY APPLE_API_ISSUER APPLE_API_KEY_P8_B64; do
+          for key in APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_API_KEY APPLE_API_ISSUER APPLE_API_KEY_P8_B64 TAURI_SIGNING_PRIVATE_KEY TAURI_UPDATER_PUBKEY; do
             if [ -z "${!key}" ]; then
               missing+=("$key")
             fi
@@ -118,6 +120,20 @@ jobs:
           printf '%s' "$APPLE_API_KEY_P8_B64" | openssl base64 -d -A > "$key_path"
           echo "APPLE_API_KEY_PATH=$key_path" >> "$GITHUB_ENV"
 
+      - name: Inject updater public key
+        env:
+          TAURI_UPDATER_PUBKEY: ${{ secrets.TAURI_UPDATER_PUBKEY }}
+        run: |
+          node <<'NODE'
+          const fs = require('node:fs');
+          const path = 'src-tauri/tauri.conf.json';
+          const json = JSON.parse(fs.readFileSync(path, 'utf8'));
+          json.plugins ??= {};
+          json.plugins.updater ??= {};
+          json.plugins.updater.pubkey = process.env.TAURI_UPDATER_PUBKEY || '';
+          fs.writeFileSync(path, `${JSON.stringify(json, null, 2)}\n`, 'utf8');
+          NODE
+
       - name: Build Tauri bundle (signed + notarized)
         env:
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
@@ -126,6 +142,8 @@ jobs:
           APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
           APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
           APPLE_API_KEY_PATH: ${{ env.APPLE_API_KEY_PATH }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: npm run tauri build
 
       - name: Verify macOS app signature
@@ -139,13 +157,61 @@ jobs:
           codesign --verify --deep --strict --verbose=2 "$app_path"
           spctl -a -t exec -vv "$app_path"
 
+      - name: Generate updater latest.json
+        env:
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ needs.create-draft-release.outputs.tag }}
+        run: |
+          updater_archive="$(find src-tauri/target/release/bundle -type f -name '*.app.tar.gz' | head -n 1)"
+          if [ -z "$updater_archive" ]; then
+            echo "No updater archive (*.app.tar.gz) found."
+            exit 1
+          fi
+
+          sig_file="${updater_archive}.sig"
+          if [ ! -f "$sig_file" ]; then
+            echo "No updater signature found: $sig_file"
+            exit 1
+          fi
+
+          arch="aarch64"
+          case "$updater_archive" in
+            *x86_64*) arch="x86_64" ;;
+            *aarch64*) arch="aarch64" ;;
+          esac
+
+          version="${TAG#v}"
+          asset_name="$(basename "$updater_archive")"
+          signature="$(tr -d '\r\n' < "$sig_file")"
+          pub_date="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+          latest_json_path="src-tauri/target/release/bundle/latest.json"
+
+          cat > "$latest_json_path" <<EOF
+          {
+            "version": "$version",
+            "notes": "skills-box $TAG",
+            "pub_date": "$pub_date",
+            "platforms": {
+              "darwin-$arch": {
+                "signature": "$signature",
+                "url": "https://github.com/$GH_REPO/releases/download/$TAG/$asset_name"
+              },
+              "darwin-$arch-app": {
+                "signature": "$signature",
+                "url": "https://github.com/$GH_REPO/releases/download/$TAG/$asset_name"
+              }
+            }
+          }
+          EOF
+          echo "Generated updater manifest: $latest_json_path"
+
       - name: Upload artifacts to draft release
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           TAG: ${{ needs.create-draft-release.outputs.tag }}
         run: |
-          files="$(find src-tauri/target/release/bundle -type f \( -name '*.dmg' -o -name '*.app.tar.gz' -o -name '*.dmg.sig' -o -name '*.app.tar.gz.sig' \) -print)"
+          files="$(find src-tauri/target/release/bundle -type f \( -name '*.dmg' -o -name '*.app.tar.gz' -o -name '*.dmg.sig' -o -name '*.app.tar.gz.sig' -o -name 'latest.json' \) -print)"
           if [ -z "$files" ]; then
             echo "No macOS bundle artifacts found."
             exit 1

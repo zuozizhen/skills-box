@@ -1,12 +1,17 @@
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::{
-    collections::{BTreeMap, HashSet},
-    env, fs, io,
+    collections::{hash_map::DefaultHasher, BTreeMap, HashMap, HashSet},
+    env, fs,
+    hash::{Hash, Hasher},
+    io,
     path::{Path, PathBuf},
     process::Command,
-    sync::{LazyLock, Mutex},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Condvar, LazyLock, Mutex,
+    },
     thread,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tauri::{
     menu::{Menu, MenuItem, PredefinedMenuItem},
@@ -18,14 +23,21 @@ const SKILL_FILE_NAMES: &[&str] = &["SKILL.md", "skill.md"];
 const DEEPSEEK_API_URL: &str = "https://api.deepseek.com/chat/completions";
 const GITHUB_LATEST_RELEASE_API_URL: &str =
     "https://api.github.com/repos/zuozizhen/skills-box/releases/latest";
-const GITHUB_RELEASES_API_URL: &str =
-    "https://api.github.com/repos/zuozizhen/skills-box/releases?per_page=20";
 const SNAPSHOT_CACHE_TTL_MS: i64 = 60_000;
-const AI_SOURCE_MARKDOWN_MAX_CHARS: usize = 24_000;
-const AI_RESPONSE_MAX_TOKENS: usize = 7500;
+const AI_SOURCE_MARKDOWN_MAX_CHARS: usize = 4_000;
+const AI_RESPONSE_MAX_TOKENS: usize = 1500;
 const AI_REQUEST_TIMEOUT_SECS: u64 = 60;
+const AI_CONNECT_TEST_TIMEOUT_SECS: u64 = 10;
+const AI_CONNECT_TEST_MAX_TOKENS: usize = 8;
 const AI_PROFILE_MAX_RETRY_ATTEMPTS: usize = 3;
 const AI_PROFILE_RETRY_BASE_DELAY_MS: u64 = 1_200;
+const WATCHER_REFRESH_MIN_INTERVAL_MS: u64 = 1_000;
+const WATCHER_RESTART_BACKOFF_MS: u64 = 1_200;
+const TRAY_FAVORITE_SUMMARY_MAX_CHARS: usize = 20;
+const SKILLS_CLI_TIMEOUT_SECS: u64 = 8;
+const UPDATE_CHECK_CACHE_TTL_MS: i64 = 10 * 60 * 1000;
+const AI_SUMMARY_MAX_CONCURRENCY: usize = 10;
+const AI_SUMMARY_QUEUE_WAIT_POLL_MS: u64 = 320;
 
 #[derive(Debug, Clone)]
 struct CachedSnapshot {
@@ -33,16 +45,108 @@ struct CachedSnapshot {
     snapshot: SkillsSnapshot,
 }
 
+#[derive(Debug, Clone)]
+struct CachedUpdateCheck {
+    checked_at: i64,
+    result: UpdateCheckResult,
+}
+
 static SNAPSHOT_CACHE: LazyLock<Mutex<Option<CachedSnapshot>>> = LazyLock::new(|| Mutex::new(None));
-static AI_PROFILE_QUEUE_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
-static AI_SUMMARY_JOB_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+static AI_SUMMARY_JOB_QUEUE: LazyLock<(Mutex<AiSummaryQueueState>, Condvar)> =
+    LazyLock::new(|| (Mutex::new(AiSummaryQueueState::default()), Condvar::new()));
 static OVERRIDES_FILE_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 static APP_CONFIG_FILE_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+static RESUMMARIZE_ALL_PROGRESS: LazyLock<Mutex<Option<ScanProgressPayload>>> =
+    LazyLock::new(|| Mutex::new(None));
+static AI_SUMMARY_STREAM_PROGRESS: LazyLock<Mutex<Option<AiSummaryStreamPayload>>> =
+    LazyLock::new(|| Mutex::new(None));
+static UPDATE_CHECK_CACHE: LazyLock<Mutex<Option<CachedUpdateCheck>>> =
+    LazyLock::new(|| Mutex::new(None));
+static TRAY_MENU_UPDATE_STATE: LazyLock<Mutex<TrayMenuUpdateState>> =
+    LazyLock::new(|| Mutex::new(TrayMenuUpdateState::default()));
+static AI_SUMMARY_CANCEL_EPOCH: AtomicU64 = AtomicU64::new(1);
 
-fn lock_ai_summary_job_queue() -> std::sync::MutexGuard<'static, ()> {
-    AI_SUMMARY_JOB_LOCK
+#[derive(Debug, Default)]
+struct AiSummaryQueueState {
+    active_jobs: usize,
+}
+
+struct AiSummaryQueueGuard;
+
+#[derive(Debug, Default)]
+struct TrayMenuUpdateState {
+    pending: bool,
+    latest_snapshot: Option<SkillsSnapshot>,
+}
+
+impl Drop for AiSummaryQueueGuard {
+    fn drop(&mut self) {
+        let (state_lock, wait_cv) = &*AI_SUMMARY_JOB_QUEUE;
+        let mut state = state_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.active_jobs = state.active_jobs.saturating_sub(1);
+        wait_cv.notify_one();
+    }
+}
+
+fn lock_ai_summary_job_queue() -> AiSummaryQueueGuard {
+    let (state_lock, wait_cv) = &*AI_SUMMARY_JOB_QUEUE;
+    let mut state = state_lock
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    while state.active_jobs >= AI_SUMMARY_MAX_CONCURRENCY {
+        state = wait_cv
+            .wait(state)
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+    }
+    state.active_jobs += 1;
+    AiSummaryQueueGuard
+}
+
+fn try_lock_ai_summary_job_queue(cancel_epoch: Option<u64>) -> Result<AiSummaryQueueGuard, String> {
+    let (state_lock, wait_cv) = &*AI_SUMMARY_JOB_QUEUE;
+    let mut state = state_lock
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+    while state.active_jobs >= AI_SUMMARY_MAX_CONCURRENCY {
+        ensure_ai_summary_not_cancelled(cancel_epoch)?;
+        let waited = wait_cv
+            .wait_timeout(state, Duration::from_millis(AI_SUMMARY_QUEUE_WAIT_POLL_MS))
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state = waited.0;
+    }
+    ensure_ai_summary_not_cancelled(cancel_epoch)?;
+    state.active_jobs += 1;
+    Ok(AiSummaryQueueGuard)
+}
+
+fn current_ai_summary_cancel_epoch() -> u64 {
+    AI_SUMMARY_CANCEL_EPOCH.load(Ordering::Relaxed)
+}
+
+fn bump_ai_summary_cancel_epoch() -> u64 {
+    AI_SUMMARY_CANCEL_EPOCH
+        .fetch_add(1, Ordering::Relaxed)
+        .saturating_add(1)
+}
+
+fn is_ai_summary_cancelled(cancel_epoch: u64) -> bool {
+    current_ai_summary_cancel_epoch() != cancel_epoch
+}
+
+fn ensure_ai_summary_not_cancelled(cancel_epoch: Option<u64>) -> Result<(), String> {
+    if let Some(epoch) = cancel_epoch {
+        if is_ai_summary_cancelled(epoch) {
+            return Err("AI 总结任务已停止".to_string());
+        }
+    }
+    Ok(())
+}
+
+fn is_ai_summary_cancel_error(message: &str) -> bool {
+    message.contains("AI 总结任务已停止")
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -133,6 +237,8 @@ struct OverridesStore {
 struct AppConfig {
     #[serde(default)]
     deepseek_api_key: Option<String>,
+    #[serde(default)]
+    onboarding_completed: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -168,13 +274,6 @@ struct ResummarizeSkillPayload {
     skill_id: String,
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct TraySkillPayload {
-    platform_id: String,
-    skill_id: String,
-}
-
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct AiSettingsStatus {
@@ -182,7 +281,7 @@ struct AiSettingsStatus {
     masked_key: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct UpdateCheckResult {
     current_version: String,
@@ -191,29 +290,11 @@ struct UpdateCheckResult {
     release_url: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct TrayFavoriteSkill {
-    platform_id: String,
-    skill_id: String,
-    name: String,
-    summary: String,
-}
-
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct GithubLatestRelease {
     tag_name: String,
     html_url: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct GithubReleaseEntry {
-    tag_name: String,
-    html_url: Option<String>,
-    #[serde(default)]
-    draft: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -231,6 +312,15 @@ struct ScanProgressPayload {
     summarized_count: usize,
     summarize_total: usize,
     current_skill: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AiSummaryStreamPayload {
+    platform_id: String,
+    skill_id: String,
+    detail_markdown: String,
+    done: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -261,11 +351,15 @@ fn resolve_home_path(input: &str) -> PathBuf {
 }
 
 fn overrides_file_path() -> Option<PathBuf> {
-    home_dir().map(|home| home.join(".opcsoskills").join("overrides.json"))
+    home_dir().map(|home| home.join(".skillsbox").join("overrides.json"))
 }
 
 fn app_config_file_path() -> Option<PathBuf> {
-    home_dir().map(|home| home.join(".opcsoskills").join("config.json"))
+    home_dir().map(|home| home.join(".skillsbox").join("config.json"))
+}
+
+fn app_config_exists() -> bool {
+    app_config_file_path().is_some_and(|path| path.exists())
 }
 
 fn normalize_version_value(input: &str) -> String {
@@ -279,7 +373,10 @@ fn override_key(platform_id: &str, skill_id: &str) -> String {
 fn write_text_atomic(path: &Path, contents: &str) -> io::Result<()> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     fs::create_dir_all(parent)?;
-    let file_name = path.file_name().and_then(|name| name.to_str()).unwrap_or("data");
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("data");
     let stamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_nanos())
@@ -317,6 +414,37 @@ fn save_overrides(store: &OverridesStore) -> io::Result<()> {
         ));
     };
     let contents = serde_json::to_string_pretty(store)
+        .map_err(|err| io::Error::other(format!("serialize overrides failed: {err}")))?;
+    write_text_atomic(&path, &contents)
+}
+
+fn upsert_ai_override_entry(
+    platform_id: &str,
+    skill_id: &str,
+    ai_brief: &str,
+    ai_detail: &str,
+) -> io::Result<()> {
+    let _guard = OVERRIDES_FILE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let Some(path) = overrides_file_path() else {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "HOME is not available for persistence",
+        ));
+    };
+
+    let mut store = fs::read_to_string(&path)
+        .ok()
+        .and_then(|contents| serde_json::from_str::<OverridesStore>(&contents).ok())
+        .unwrap_or_default();
+
+    let key = override_key(platform_id, skill_id);
+    let entry = store.entries.entry(key).or_default();
+    entry.ai_brief = Some(ai_brief.to_string());
+    entry.ai_detail = Some(ai_detail.to_string());
+
+    let contents = serde_json::to_string_pretty(&store)
         .map_err(|err| io::Error::other(format!("serialize overrides failed: {err}")))?;
     write_text_atomic(&path, &contents)
 }
@@ -1251,7 +1379,7 @@ fn unwrap_markdown_fence(input: &str) -> String {
 
 fn trim_ai_markdown(input: &str) -> String {
     let unfenced = unwrap_markdown_fence(input);
-    unfenced
+    let normalized = unfenced
         .replace("\r\n", "\n")
         .replace('\r', "\n")
         .lines()
@@ -1259,7 +1387,44 @@ fn trim_ai_markdown(input: &str) -> String {
         .collect::<Vec<_>>()
         .join("\n")
         .trim()
-        .to_string()
+        .to_string();
+
+    remove_markdown_section_by_h2(
+        &normalized,
+        &["注意事项与边界", "注意事项与限制", "注意事项", "边界"],
+    )
+}
+
+fn remove_markdown_section_by_h2(input: &str, headings: &[&str]) -> String {
+    if input.trim().is_empty() {
+        return String::new();
+    }
+
+    let mut output: Vec<String> = Vec::new();
+    let mut skipping = false;
+
+    for line in input.lines() {
+        let trimmed = line.trim();
+        let lower = trimmed.to_lowercase();
+        let is_h2 = lower.starts_with("## ");
+        if is_h2 {
+            let title = trimmed.trim_start_matches('#').trim();
+            let should_skip = headings
+                .iter()
+                .any(|candidate| title.starts_with(candidate));
+            if should_skip {
+                skipping = true;
+                continue;
+            }
+            skipping = false;
+        }
+        if skipping {
+            continue;
+        }
+        output.push(line.to_string());
+    }
+
+    output.join("\n").trim().to_string()
 }
 
 fn parse_ai_profile_text(text: &str) -> Option<AiSkillProfile> {
@@ -1352,7 +1517,11 @@ fn extract_deepseek_content(text: &str) -> Result<String, String> {
         .ok_or_else(|| "DeepSeek 响应缺少 content".to_string())
 }
 
-fn build_ai_prompt(platform_name: &str, skill: &SkillData) -> String {
+fn build_ai_prompt(
+    platform_name: &str,
+    skill: &SkillData,
+    source_markdown_max_chars: usize,
+) -> String {
     let source_description = skill.source_description.trim();
     let source_usage = skill.source_usage.trim();
     let source_markdown = skill.source_markdown.trim();
@@ -1364,7 +1533,7 @@ fn build_ai_prompt(platform_name: &str, skill: &SkillData) -> String {
     let source_markdown_for_prompt = if source_markdown.is_empty() {
         String::new()
     } else {
-        take_chars(source_markdown, AI_SOURCE_MARKDOWN_MAX_CHARS)
+        take_chars(source_markdown, source_markdown_max_chars)
     };
 
     let payload = serde_json::json!({
@@ -1375,11 +1544,11 @@ fn build_ai_prompt(platform_name: &str, skill: &SkillData) -> String {
         "source_usage": source_usage,
         "source_commands": commands,
         "skill_path": skill.path,
-        "source_markdown_truncated_chars": AI_SOURCE_MARKDOWN_MAX_CHARS,
+        "source_markdown_truncated_chars": source_markdown_max_chars,
     });
 
     format!(
-        "请基于下面的技能元数据和 SKILL.md 全文，生成“专业但易懂”的中文说明，目标是让用户快速上手并理解边界。\n\n元数据(JSON):\n{}\n\nSKILL.md 全文（可能已截断）:\n~~~markdown\n{}\n~~~\n\n输出要求:\n1) 严格输出 JSON: {{\"brief\":\"...\",\"detail\":\"...\"}}\n2) brief: 1 句话，16-32 字，直说核心价值，不要口号。\n3) detail: 必须是 Markdown，内容尽可能详尽、结构化、专业，建议使用以下二级标题（若信息不足可合并，但不要省略关键点）：\n   - ## 核心能力\n   - ## 适用场景\n   - ## 输入与输出\n   - ## 快速开始\n   - ## 常用命令与操作\n   - ## 注意事项与边界\n   - ## 常见问题与排查\n4) detail 要求：\n   - 先讲清“做什么”，再讲“何时用”，最后讲“怎么用”\n   - 步骤可执行，尽量具体到首个命令/入口\n   - 对参数、前置条件、失败场景给出明确提示\n   - 若文档有命令，必须整理成可直接复制的代码块\n5) 严禁编造输入里没有的能力；信息缺失时明确写“文档未提供”。\n6) 保留关键英文专有名词（框架名、命令名、API 字段名），其余用自然中文。\n7) 不要输出与该技能无关的背景知识，不要空泛。",
+        "请基于下面的技能元数据和 SKILL.md 全文，生成“精炼、易懂、重点明确”的中文说明。\n\n元数据(JSON):\n{}\n\nSKILL.md 全文（可能已截断）:\n~~~markdown\n{}\n~~~\n\n输出要求:\n1) 严格输出 JSON: {{\"brief\":\"...\",\"detail\":\"...\"}}，字段顺序必须先 brief，再 detail。\n2) brief: 1 句话，16-30 字，直说核心价值，不要口号。\n3) detail: 必须是 Markdown，仅保留这两个二级标题（按顺序输出）：\n   - ## 什么时候用\n   - ## 怎么用\n4) detail 写作约束：\n   - 突出重点，不要废话，不要背景铺垫\n   - 总长度建议 400-900 字\n   - “什么时候用”写清典型场景、触发条件、不适用边界\n   - “怎么用”写清最短可执行步骤、关键参数/输入输出、常见失败处理\n   - 有命令就给可直接复制的代码块\n   - 严禁编造输入里没有的能力；信息缺失时写“文档未提供”\n   - 不要输出“注意事项与边界”章节\n5) 保留关键英文专有名词（框架名、命令名、API 字段名），其余用自然中文。",
         payload, source_markdown_for_prompt
     )
 }
@@ -1422,18 +1591,22 @@ fn call_deepseek_profile_once(
     platform_name: &str,
     skill: &SkillData,
     api_key: &str,
+    source_markdown_max_chars: usize,
+    response_max_tokens: usize,
+    cancel_epoch: Option<u64>,
 ) -> Result<AiSkillProfile, String> {
-    let prompt = build_ai_prompt(platform_name, skill);
+    ensure_ai_summary_not_cancelled(cancel_epoch)?;
+    let prompt = build_ai_prompt(platform_name, skill, source_markdown_max_chars);
 
     let body = serde_json::json!({
         "model": "deepseek-chat",
         "temperature": 0.1,
-        "max_tokens": AI_RESPONSE_MAX_TOKENS,
+        "max_tokens": response_max_tokens,
         "response_format": { "type": "json_object" },
         "messages": [
             {
                 "role": "system",
-                "content": "你是“技能说明编辑器”。你要输出专业、准确、可执行、结构清晰的中文技能文档。必须忠于输入，不臆测，不输出多余字段。只返回 JSON，其中 detail 字段使用 Markdown。"
+                "content": "你是“技能说明编辑器”。输出必须精炼、易懂、重点明确、可执行，不说废话。必须忠于输入，不臆测，不输出多余字段。只返回 JSON，字段顺序 brief 再 detail，其中 detail 使用 Markdown。"
             },
             {
                 "role": "user",
@@ -1443,6 +1616,7 @@ fn call_deepseek_profile_once(
     });
 
     let text = deepseek_post(api_key, &body, Duration::from_secs(AI_REQUEST_TIMEOUT_SECS))?;
+    ensure_ai_summary_not_cancelled(cancel_epoch)?;
     let content = extract_deepseek_content(&text)?;
 
     let profile =
@@ -1457,24 +1631,34 @@ fn call_deepseek_profile_once(
     Ok(AiSkillProfile { brief, detail })
 }
 
-fn call_deepseek_profile(
+fn call_deepseek_profile_with_limits(
     platform_name: &str,
     skill: &SkillData,
     api_key: &str,
+    source_markdown_max_chars: usize,
+    response_max_tokens: usize,
+    cancel_epoch: Option<u64>,
 ) -> Result<AiSkillProfile, String> {
-    let _queue_guard = AI_PROFILE_QUEUE_LOCK
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-
     let max_retries = AI_PROFILE_MAX_RETRY_ATTEMPTS.saturating_sub(1);
     let mut retried = 0usize;
     let mut last_error = String::new();
 
     for attempt in 1..=AI_PROFILE_MAX_RETRY_ATTEMPTS {
-        match call_deepseek_profile_once(platform_name, skill, api_key) {
+        ensure_ai_summary_not_cancelled(cancel_epoch)?;
+        match call_deepseek_profile_once(
+            platform_name,
+            skill,
+            api_key,
+            source_markdown_max_chars,
+            response_max_tokens,
+            cancel_epoch,
+        ) {
             Ok(profile) => return Ok(profile),
             Err(err) => {
                 last_error = err.clone();
+                if is_ai_summary_cancel_error(&err) {
+                    return Err(err);
+                }
                 let is_last_attempt = attempt >= AI_PROFILE_MAX_RETRY_ATTEMPTS;
                 if is_last_attempt || !should_retry_deepseek_error(&err) {
                     return Err(format!("{err}（重试 {retried}/{max_retries}）"));
@@ -1488,35 +1672,240 @@ fn call_deepseek_profile(
         }
     }
 
-    Err(format!(
-        "{last_error}（重试 {retried}/{max_retries}）"
-    ))
+    Err(format!("{last_error}（重试 {retried}/{max_retries}）"))
 }
 
-fn build_deepseek_test_skill() -> SkillData {
-    SkillData {
-        id: "deepseek-connectivity-test".to_string(),
-        name: "DeepSeek 连通测试".to_string(),
-        source_name: "DeepSeek 连通测试".to_string(),
-        source_usage: "用于验证当前 Key 是否可用于技能总结。".to_string(),
-        source_description: "这是一个仅用于连通性和响应格式校验的测试技能。".to_string(),
-        source_markdown: "# DeepSeek 连通测试\n\n这是一个仅用于连通性和响应格式校验的测试技能。"
-            .to_string(),
-        source_commands: vec!["npx skills list".to_string()],
-        ai_brief: String::new(),
-        ai_detail: String::new(),
-        favorite: false,
-        status: SkillStatus::Active,
-        path: "/virtual/deepseek-connectivity-test".to_string(),
-        definition_path: "/virtual/deepseek-connectivity-test/SKILL.md".to_string(),
-        installed_at: None,
-        first_seen_at: None,
+fn call_deepseek_profile(
+    platform_name: &str,
+    skill: &SkillData,
+    api_key: &str,
+    cancel_epoch: Option<u64>,
+) -> Result<AiSkillProfile, String> {
+    call_deepseek_profile_with_limits(
+        platform_name,
+        skill,
+        api_key,
+        AI_SOURCE_MARKDOWN_MAX_CHARS,
+        AI_RESPONSE_MAX_TOKENS,
+        cancel_epoch,
+    )
+}
+
+fn extract_partial_detail_from_json_like(raw: &str) -> Option<String> {
+    let key_pos = raw.find("\"detail\"")?;
+    let mut tail = &raw[key_pos + "\"detail\"".len()..];
+
+    let colon_pos = tail.find(':')?;
+    tail = &tail[colon_pos + 1..];
+    tail = tail.trim_start();
+    if !tail.starts_with('"') {
+        return None;
     }
+    tail = &tail[1..];
+
+    let mut output = String::new();
+    let mut escaped = false;
+
+    for ch in tail.chars() {
+        if escaped {
+            match ch {
+                'n' => output.push('\n'),
+                'r' => output.push('\r'),
+                't' => output.push('\t'),
+                '"' => output.push('"'),
+                '\\' => output.push('\\'),
+                '/' => output.push('/'),
+                _ => output.push(ch),
+            }
+            escaped = false;
+            continue;
+        }
+
+        if ch == '\\' {
+            escaped = true;
+            continue;
+        }
+
+        if ch == '"' {
+            return Some(output);
+        }
+
+        output.push(ch);
+    }
+
+    Some(output)
+}
+
+fn call_deepseek_profile_streaming<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    platform_id: &str,
+    skill_id: &str,
+    platform_name: &str,
+    skill: &SkillData,
+    api_key: &str,
+    cancel_epoch: Option<u64>,
+) -> Result<AiSkillProfile, String> {
+    use std::io::BufRead;
+    ensure_ai_summary_not_cancelled(cancel_epoch)?;
+
+    let prompt = build_ai_prompt(platform_name, skill, AI_SOURCE_MARKDOWN_MAX_CHARS);
+    let body = serde_json::json!({
+        "model": "deepseek-chat",
+        "temperature": 0.1,
+        "max_tokens": AI_RESPONSE_MAX_TOKENS,
+        "stream": true,
+        "messages": [
+            {
+                "role": "system",
+                "content": "你是“技能说明编辑器”。输出必须精炼、易懂、重点明确、可执行，不说废话。必须忠于输入，不臆测，不输出多余字段。只返回 JSON，字段顺序 brief 再 detail，其中 detail 使用 Markdown。"
+            },
+            {
+                "role": "user",
+                "content": prompt
+            }
+        ]
+    });
+
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(AI_REQUEST_TIMEOUT_SECS))
+        .build()
+        .map_err(|err| format!("DeepSeek 客户端初始化失败: {err}"))?;
+
+    let response = client
+        .post(DEEPSEEK_API_URL)
+        .header(reqwest::header::AUTHORIZATION, format!("Bearer {api_key}"))
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .json(&body)
+        .send()
+        .map_err(|err| format!("DeepSeek 请求失败: {err}"))?;
+    ensure_ai_summary_not_cancelled(cancel_epoch)?;
+
+    let status = response.status();
+    if !status.is_success() {
+        let text = response
+            .text()
+            .map_err(|err| format!("DeepSeek 响应读取失败: {err}"))?;
+        if let Some(message) = extract_deepseek_error_message(&text) {
+            return Err(format!(
+                "DeepSeek 返回异常: HTTP {} - {message}",
+                status.as_u16()
+            ));
+        }
+        return Err(format!("DeepSeek 返回异常: HTTP {}", status.as_u16()));
+    }
+
+    let mut reader = io::BufReader::new(response);
+    let mut line = String::new();
+    let mut content = String::new();
+    let mut last_emit_at = Instant::now();
+    let mut saw_delta = false;
+
+    loop {
+        ensure_ai_summary_not_cancelled(cancel_epoch)?;
+        line.clear();
+        let read_bytes = reader
+            .read_line(&mut line)
+            .map_err(|err| format!("DeepSeek 流读取失败: {err}"))?;
+        if read_bytes == 0 {
+            break;
+        }
+
+        let trimmed = line.trim();
+        if !trimmed.starts_with("data:") {
+            continue;
+        }
+        let data = trimmed.trim_start_matches("data:").trim();
+        if data.is_empty() {
+            continue;
+        }
+        if data == "[DONE]" {
+            break;
+        }
+
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(data) else {
+            continue;
+        };
+
+        let delta = value
+            .get("choices")
+            .and_then(|choices| choices.get(0))
+            .and_then(|choice| choice.get("delta"))
+            .and_then(|delta| delta.get("content"))
+            .and_then(|content| content.as_str());
+
+        let Some(delta_text) = delta else {
+            continue;
+        };
+
+        if delta_text.is_empty() {
+            continue;
+        }
+        saw_delta = true;
+        content.push_str(delta_text);
+
+        if last_emit_at.elapsed() >= Duration::from_millis(120) || delta_text.contains('\n') {
+            if let Some(detail_markdown) = extract_partial_detail_from_json_like(&content) {
+                emit_ai_summary_stream(
+                    app,
+                    AiSummaryStreamPayload {
+                        platform_id: platform_id.to_string(),
+                        skill_id: skill_id.to_string(),
+                        detail_markdown,
+                        done: false,
+                    },
+                );
+                last_emit_at = Instant::now();
+            }
+        }
+    }
+
+    if !saw_delta {
+        return Err("DeepSeek 流式响应为空".to_string());
+    }
+
+    let profile =
+        parse_ai_profile_text(&content).ok_or_else(|| "AI 描述格式解析失败".to_string())?;
+    ensure_ai_summary_not_cancelled(cancel_epoch)?;
+    let brief = trim_ai_brief(&profile.brief);
+    let detail = trim_ai_markdown(&profile.detail);
+    if brief.is_empty() || detail.is_empty() {
+        return Err("AI 描述内容为空".to_string());
+    }
+
+    emit_ai_summary_stream(
+        app,
+        AiSummaryStreamPayload {
+            platform_id: platform_id.to_string(),
+            skill_id: skill_id.to_string(),
+            detail_markdown: detail.clone(),
+            done: true,
+        },
+    );
+
+    Ok(AiSkillProfile { brief, detail })
 }
 
 fn test_deepseek_api_key_request(api_key: &str) -> Result<(), String> {
-    let probe = build_deepseek_test_skill();
-    call_deepseek_profile("DeepSeek 测试", &probe, api_key).map(|_| ())
+    let body = serde_json::json!({
+        "model": "deepseek-chat",
+        "temperature": 0,
+        "max_tokens": AI_CONNECT_TEST_MAX_TOKENS,
+        "messages": [
+            { "role": "system", "content": "You are a connectivity probe. Reply with a short text." },
+            { "role": "user", "content": "ping" }
+        ]
+    });
+
+    let text = deepseek_post(
+        api_key,
+        &body,
+        Duration::from_secs(AI_CONNECT_TEST_TIMEOUT_SECS),
+    )?;
+    let content = extract_deepseek_content(&text)?;
+    if content.trim().is_empty() {
+        return Err("DeepSeek 连通测试返回空内容".to_string());
+    }
+    Ok(())
 }
 
 fn enrich_missing_ai_profiles(
@@ -1538,7 +1927,7 @@ fn enrich_missing_ai_profiles(
                 continue;
             }
 
-            let Ok(profile) = call_deepseek_profile(&platform.name, skill, api_key) else {
+            let Ok(profile) = call_deepseek_profile(&platform.name, skill, api_key, None) else {
                 continue;
             };
 
@@ -1585,12 +1974,44 @@ fn ensure_first_seen_records(
 }
 
 fn run_skills_cli_list_json(global: bool) -> Vec<SkillsCliEntry> {
+    fn run_command_with_timeout(program: &str, args: &[&str]) -> Option<std::process::Output> {
+        use std::process::Stdio;
+
+        let mut child = Command::new(program)
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .ok()?;
+
+        let start = Instant::now();
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) => return child.wait_with_output().ok(),
+                Ok(None) => {
+                    if start.elapsed() >= Duration::from_secs(SKILLS_CLI_TIMEOUT_SECS) {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        return None;
+                    }
+                    thread::sleep(Duration::from_millis(120));
+                }
+                Err(_) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return None;
+                }
+            }
+        }
+    }
+
     let mut skills_args = vec!["list", "--json"];
     if global {
         skills_args.push("-g");
     }
 
-    if let Ok(output) = Command::new("skills").args(&skills_args).output() {
+    if let Some(output) = run_command_with_timeout("skills", &skills_args) {
         if output.status.success() {
             let stdout = String::from_utf8_lossy(&output.stdout);
             let parsed = parse_json_array_from_text::<SkillsCliEntry>(&stdout);
@@ -1605,7 +2026,7 @@ fn run_skills_cli_list_json(global: bool) -> Vec<SkillsCliEntry> {
         npx_args.push("-g");
     }
 
-    if let Ok(output) = Command::new("npx").args(&npx_args).output() {
+    if let Some(output) = run_command_with_timeout("npx", &npx_args) {
         if output.status.success() {
             let stdout = String::from_utf8_lossy(&output.stdout);
             return parse_json_array_from_text::<SkillsCliEntry>(&stdout);
@@ -2006,6 +2427,8 @@ fn build_skills_snapshot(summarize_pending: bool) -> SkillsSnapshot {
         platforms.push(platform);
     }
 
+    dedupe_skills_across_platforms(&mut platforms);
+
     let mut changed = ensure_first_seen_records(&mut platforms, &mut overrides);
     if summarize_pending {
         if let Some(api_key) = deepseek_api_key() {
@@ -2050,6 +2473,110 @@ fn load_skills_snapshot_internal(force_scan: bool, summarize_pending: bool) -> S
     snapshot
 }
 
+fn skill_dedupe_signature(skill: &SkillData) -> String {
+    let normalized_name =
+        collapse_whitespace_to_single_line(skill.source_name.trim()).to_lowercase();
+    let fingerprint_source_raw = if !skill.source_markdown.trim().is_empty() {
+        collapse_whitespace_to_single_line(skill.source_markdown.trim()).to_lowercase()
+    } else if !skill.source_description.trim().is_empty() {
+        collapse_whitespace_to_single_line(skill.source_description.trim()).to_lowercase()
+    } else if !skill.source_usage.trim().is_empty() {
+        collapse_whitespace_to_single_line(skill.source_usage.trim()).to_lowercase()
+    } else {
+        Path::new(&skill.definition_path)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or(skill.id.as_str())
+            .to_lowercase()
+    };
+    let fingerprint_source = take_chars(&fingerprint_source_raw, 4000);
+
+    let mut hasher = DefaultHasher::new();
+    normalized_name.hash(&mut hasher);
+    fingerprint_source.hash(&mut hasher);
+    format!("{normalized_name}::{:016x}", hasher.finish())
+}
+
+fn merge_duplicate_skill_data(target: &mut SkillData, incoming: &SkillData) {
+    if target.name.trim().is_empty() && !incoming.name.trim().is_empty() {
+        target.name = incoming.name.clone();
+    }
+    if target.source_name.trim().is_empty() && !incoming.source_name.trim().is_empty() {
+        target.source_name = incoming.source_name.clone();
+    }
+    if target.source_usage.trim().is_empty() && !incoming.source_usage.trim().is_empty() {
+        target.source_usage = incoming.source_usage.clone();
+    }
+    if target.source_description.trim().is_empty() && !incoming.source_description.trim().is_empty()
+    {
+        target.source_description = incoming.source_description.clone();
+    }
+    if target.source_markdown.trim().is_empty() && !incoming.source_markdown.trim().is_empty() {
+        target.source_markdown = incoming.source_markdown.clone();
+    }
+    if target.source_commands.is_empty() && !incoming.source_commands.is_empty() {
+        target.source_commands = incoming.source_commands.clone();
+    }
+    if target.ai_brief.trim().is_empty() && !incoming.ai_brief.trim().is_empty() {
+        target.ai_brief = incoming.ai_brief.clone();
+    }
+    if target.ai_detail.trim().is_empty() && !incoming.ai_detail.trim().is_empty() {
+        target.ai_detail = incoming.ai_detail.clone();
+    }
+    if target.path.trim().is_empty() && !incoming.path.trim().is_empty() {
+        target.path = incoming.path.clone();
+    }
+    if target.definition_path.trim().is_empty() && !incoming.definition_path.trim().is_empty() {
+        target.definition_path = incoming.definition_path.clone();
+    }
+    match (target.installed_at, incoming.installed_at) {
+        (Some(current), Some(next)) if next > current => target.installed_at = Some(next),
+        (None, Some(next)) => target.installed_at = Some(next),
+        _ => {}
+    }
+    match (target.first_seen_at, incoming.first_seen_at) {
+        (Some(current), Some(next)) if next < current => target.first_seen_at = Some(next),
+        (None, Some(next)) => target.first_seen_at = Some(next),
+        _ => {}
+    }
+}
+
+fn dedupe_skills_across_platforms(platforms: &mut [PlatformData]) {
+    let mut signature_to_index = HashMap::<String, usize>::new();
+    let mut canonical = Vec::<(usize, SkillData)>::new();
+
+    for (platform_index, platform) in platforms.iter().enumerate() {
+        for skill in &platform.skills {
+            let signature = skill_dedupe_signature(skill);
+            if let Some(existing_index) = signature_to_index.get(&signature).copied() {
+                if let Some((_, kept_skill)) = canonical.get_mut(existing_index) {
+                    merge_duplicate_skill_data(kept_skill, skill);
+                }
+                continue;
+            }
+            signature_to_index.insert(signature, canonical.len());
+            canonical.push((platform_index, skill.clone()));
+        }
+    }
+
+    for platform in platforms.iter_mut() {
+        platform.skills.clear();
+    }
+
+    for (platform_index, skill) in canonical {
+        if let Some(platform) = platforms.get_mut(platform_index) {
+            platform.skills.push(skill);
+        }
+    }
+}
+
+fn load_cached_snapshot_any_age() -> Option<SkillsSnapshot> {
+    let cache = SNAPSHOT_CACHE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    cache.as_ref().map(|entry| entry.snapshot.clone())
+}
+
 fn write_snapshot_cache(snapshot: &SkillsSnapshot) {
     let now = system_time_to_unix_millis(SystemTime::now()).unwrap_or_default();
     let mut cache = SNAPSHOT_CACHE
@@ -2091,7 +2618,110 @@ fn emit_scan_progress<R: tauri::Runtime>(
         summarize_total,
         current_skill,
     };
-    let _ = app.emit("scan_progress", payload);
+    let should_log = stage.starts_with("resummarize_all");
+    if should_log {
+        let mut progress = RESUMMARIZE_ALL_PROGRESS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *progress = Some(payload.clone());
+    }
+    let mut delivered = false;
+
+    if let Some(window) = app.get_webview_window("dashboard") {
+        if let Err(err) = window.emit("scan_progress", payload.clone()) {
+            eprintln!("[scan_progress] emit failed window=dashboard stage={stage}: {err}");
+        } else {
+            delivered = true;
+        }
+    }
+
+    if let Some(window) = app.get_webview_window("main") {
+        if let Err(err) = window.emit("scan_progress", payload.clone()) {
+            eprintln!("[scan_progress] emit failed window=main stage={stage}: {err}");
+        } else {
+            delivered = true;
+        }
+    }
+
+    if !delivered {
+        if let Err(err) = app.emit("scan_progress", payload) {
+            eprintln!("[scan_progress] emit fallback failed stage={stage}: {err}");
+        } else if should_log {
+            eprintln!(
+                "[scan_progress] emitted via app stage={stage}, summarized={summarized_count}, total={summarize_total}"
+            );
+        }
+    } else if should_log {
+        eprintln!(
+            "[scan_progress] emitted stage={stage}, summarized={summarized_count}, total={summarize_total}"
+        );
+    }
+}
+
+fn emit_ai_summary_stream<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    payload: AiSummaryStreamPayload,
+) {
+    {
+        let mut stream = AI_SUMMARY_STREAM_PROGRESS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *stream = Some(payload.clone());
+    }
+
+    eprintln!(
+        "[ai_summary_stream] emit {}::{} len={} done={}",
+        payload.platform_id,
+        payload.skill_id,
+        payload.detail_markdown.len(),
+        payload.done
+    );
+    let mut delivered = false;
+
+    if let Some(window) = app.get_webview_window("dashboard") {
+        if window.emit("ai_summary_stream", payload.clone()).is_ok() {
+            delivered = true;
+        }
+    }
+
+    if let Some(window) = app.get_webview_window("main") {
+        if window.emit("ai_summary_stream", payload.clone()).is_ok() {
+            delivered = true;
+        }
+    }
+
+    if !delivered {
+        let _ = app.emit("ai_summary_stream", payload);
+    }
+}
+
+#[tauri::command]
+fn get_ai_summary_stream_latest() -> Option<AiSummaryStreamPayload> {
+    let stream = AI_SUMMARY_STREAM_PROGRESS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    stream.clone()
+}
+
+#[tauri::command]
+fn get_resummarize_all_progress() -> Option<ScanProgressPayload> {
+    let progress = RESUMMARIZE_ALL_PROGRESS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    progress.clone()
+}
+
+#[tauri::command]
+fn cancel_ai_summary_jobs() -> usize {
+    let _ = bump_ai_summary_cancel_epoch();
+    let (state_lock, wait_cv) = &*AI_SUMMARY_JOB_QUEUE;
+    let state = state_lock
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let active_jobs = state.active_jobs;
+    drop(state);
+    wait_cv.notify_all();
+    active_jobs
 }
 
 fn emit_skills_snapshot<R: tauri::Runtime>(app: &tauri::AppHandle<R>, snapshot: &SkillsSnapshot) {
@@ -2100,7 +2730,7 @@ fn emit_skills_snapshot<R: tauri::Runtime>(app: &tauri::AppHandle<R>, snapshot: 
 
 fn map_update_http_error(code: u16) -> String {
     match code {
-        403 | 429 => "检查更新过于频繁，请稍后再试".to_string(),
+        403 | 429 => "更新服务暂时不可用，请稍后重试".to_string(),
         _ => format!("更新服务暂时不可用 (HTTP {code})"),
     }
 }
@@ -2120,47 +2750,16 @@ fn fetch_latest_release(
         .text()
         .map_err(|err| format!("检查更新响应读取失败: {err}"))?;
 
-    if status.is_success() {
-        let release: GithubLatestRelease = serde_json::from_str(&body)
-            .map_err(|_| "更新信息解析失败，请稍后重试".to_string())?;
-        return Ok(Some(release));
+    if status.as_u16() == 404 {
+        return Ok(None);
     }
-
-    if status.as_u16() != 404 {
-        return Err(map_update_http_error(status.as_u16()));
-    }
-
-    let response = client
-        .get(GITHUB_RELEASES_API_URL)
-        .header(reqwest::header::USER_AGENT, "skills-box")
-        .header(reqwest::header::ACCEPT, "application/vnd.github+json")
-        .send()
-        .map_err(|err| format!("检查更新请求失败: {err}"))?;
-
-    let status = response.status();
-    let body = response
-        .text()
-        .map_err(|err| format!("检查更新响应读取失败: {err}"))?;
-
     if !status.is_success() {
-        if status.as_u16() == 404 {
-            return Ok(None);
-        }
         return Err(map_update_http_error(status.as_u16()));
     }
 
-    let releases: Vec<GithubReleaseEntry> =
+    let release: GithubLatestRelease =
         serde_json::from_str(&body).map_err(|_| "更新信息解析失败，请稍后重试".to_string())?;
-
-    let latest = releases
-        .into_iter()
-        .find(|release| !release.draft)
-        .map(|release| GithubLatestRelease {
-            tag_name: release.tag_name,
-            html_url: release.html_url,
-        });
-
-    Ok(latest)
+    Ok(Some(release))
 }
 
 fn check_for_updates_internal(current_version: String) -> Result<UpdateCheckResult, String> {
@@ -2171,12 +2770,7 @@ fn check_for_updates_internal(current_version: String) -> Result<UpdateCheckResu
 
     let current_clean = normalize_version_value(&current_version);
     let Some(release) = fetch_latest_release(&client)? else {
-        return Ok(UpdateCheckResult {
-            current_version: current_clean.clone(),
-            latest_version: current_clean,
-            has_update: false,
-            release_url: None,
-        });
+        return Err("没有可用正式更新".to_string());
     };
 
     let latest_clean = normalize_version_value(&release.tag_name);
@@ -2198,6 +2792,45 @@ fn check_for_updates_internal(current_version: String) -> Result<UpdateCheckResu
         has_update,
         release_url: release.html_url,
     })
+}
+
+fn check_for_updates_cached_internal(current_version: String) -> Result<UpdateCheckResult, String> {
+    let now = system_time_to_unix_millis(SystemTime::now()).unwrap_or_default();
+    let cached = {
+        let cache = UPDATE_CHECK_CACHE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        cache.clone()
+    };
+
+    if let Some(entry) = cached.as_ref() {
+        let age = now.saturating_sub(entry.checked_at);
+        if age <= UPDATE_CHECK_CACHE_TTL_MS {
+            return Ok(entry.result.clone());
+        }
+    }
+
+    match check_for_updates_internal(current_version) {
+        Ok(result) => {
+            let mut cache = UPDATE_CHECK_CACHE
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            *cache = Some(CachedUpdateCheck {
+                checked_at: now,
+                result: result.clone(),
+            });
+            Ok(result)
+        }
+        Err(err) => {
+            let lower = err.to_lowercase();
+            if (err.contains("过于频繁") || lower.contains("rate")) && cached.is_some() {
+                if let Some(entry) = cached {
+                    return Ok(entry.result);
+                }
+            }
+            Err(err)
+        }
+    }
 }
 
 fn should_process_notify_event(event: &notify::Event) -> bool {
@@ -2300,50 +2933,111 @@ fn reconcile_watch_targets(
     *watched = desired;
 }
 
-fn start_filesystem_watcher(app_handle: tauri::AppHandle) {
-    thread::spawn(move || {
-        use notify::{Config, RecommendedWatcher, Watcher};
+fn run_filesystem_watcher_loop(app_handle: tauri::AppHandle) {
+    use notify::{Config, RecommendedWatcher, Watcher};
+    use std::sync::mpsc::RecvTimeoutError;
 
-        let (tx, rx) = std::sync::mpsc::channel();
-        let mut watcher = match RecommendedWatcher::new(
-            move |result| {
-                let _ = tx.send(result);
-            },
-            Config::default(),
-        ) {
-            Ok(watcher) => watcher,
-            Err(_) => return,
+    let (tx, rx) = std::sync::mpsc::channel();
+    let mut watcher = match RecommendedWatcher::new(
+        move |result| {
+            let _ = tx.send(result);
+        },
+        Config::default(),
+    ) {
+        Ok(watcher) => watcher,
+        Err(err) => {
+            eprintln!("[watcher] init failed: {err}");
+            return;
+        }
+    };
+
+    let mut watched = BTreeMap::<String, (PathBuf, notify::RecursiveMode)>::new();
+    reconcile_watch_targets(&mut watcher, &mut watched);
+    let min_refresh_interval = Duration::from_millis(WATCHER_REFRESH_MIN_INTERVAL_MS);
+    let mut last_refresh_started_at: Option<Instant> = None;
+
+    loop {
+        let Ok(first) = rx.recv() else {
+            eprintln!("[watcher] event channel disconnected");
+            break;
         };
 
-        let mut watched = BTreeMap::<String, (PathBuf, notify::RecursiveMode)>::new();
-        reconcile_watch_targets(&mut watcher, &mut watched);
+        let mut changed = match first {
+            Ok(event) => should_process_notify_event(&event),
+            Err(_) => false,
+        };
 
-        loop {
-            let Ok(first) = rx.recv() else {
-                break;
-            };
+        while let Ok(next) = rx.recv_timeout(Duration::from_millis(280)) {
+            if let Ok(event) = next {
+                if should_process_notify_event(&event) {
+                    changed = true;
+                }
+            }
+        }
 
-            let mut changed = match first {
-                Ok(event) => should_process_notify_event(&event),
-                Err(_) => false,
-            };
+        if !changed {
+            continue;
+        }
 
-            while let Ok(next) = rx.recv_timeout(Duration::from_millis(280)) {
-                if let Ok(event) = next {
-                    if should_process_notify_event(&event) {
-                        changed = true;
+        if let Some(last_started_at) = last_refresh_started_at {
+            let elapsed = last_started_at.elapsed();
+            if elapsed < min_refresh_interval {
+                let wait_for = min_refresh_interval - elapsed;
+                let deadline = Instant::now() + wait_for;
+                loop {
+                    let timeout = deadline.saturating_duration_since(Instant::now());
+                    if timeout.is_zero() {
+                        break;
+                    }
+                    match rx.recv_timeout(timeout.min(Duration::from_millis(180))) {
+                        Ok(Ok(event)) => {
+                            if should_process_notify_event(&event) {
+                                changed = true;
+                            }
+                        }
+                        Ok(Err(_)) => {}
+                        Err(RecvTimeoutError::Timeout) => break,
+                        Err(RecvTimeoutError::Disconnected) => {
+                            eprintln!("[watcher] event channel disconnected while waiting");
+                            return;
+                        }
                     }
                 }
             }
+        }
+        if !changed {
+            continue;
+        }
 
-            if !changed {
+        reconcile_watch_targets(&mut watcher, &mut watched);
+        last_refresh_started_at = Some(Instant::now());
+        let snapshot = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            refresh_skills_with_auto_ai_internal(app_handle.clone())
+        })) {
+            Ok(snapshot) => snapshot,
+            Err(_) => {
+                eprintln!("[watcher] refresh_skills_with_auto_ai_internal panicked");
                 continue;
             }
+        };
+        emit_skills_snapshot(&app_handle, &snapshot);
+    }
+}
 
-            reconcile_watch_targets(&mut watcher, &mut watched);
-            let snapshot = refresh_skills_with_auto_ai_internal(app_handle.clone());
-            emit_skills_snapshot(&app_handle, &snapshot);
+fn start_filesystem_watcher(app_handle: tauri::AppHandle) {
+    thread::spawn(move || loop {
+        let loop_handle = app_handle.clone();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_filesystem_watcher_loop(loop_handle);
+        }));
+
+        if result.is_err() {
+            eprintln!("[watcher] watcher loop panicked, restarting");
+        } else {
+            eprintln!("[watcher] watcher loop exited, restarting");
         }
+
+        thread::sleep(Duration::from_millis(WATCHER_RESTART_BACKOFF_MS));
     });
 }
 
@@ -2384,25 +3078,98 @@ fn apply_update_to_cached_snapshot(payload: &UpdateSkillPayload) -> Option<Skill
     Some(entry.snapshot.clone())
 }
 
-fn build_tray_menu<R: tauri::Runtime, M: Manager<R>>(
-    manager: &M,
-) -> tauri::Result<Menu<R>> {
-    let menu = Menu::new(manager)?;
-    let dashboard_item = MenuItem::with_id(manager, "open_dashboard", "Dashboard", true, None::<&str>)?;
-    let bottom_separator = PredefinedMenuItem::separator(manager)?;
-    let quit_i = MenuItem::with_id(manager, "quit", "Quit", true, None::<&str>)?;
-    menu.append_items(&[&dashboard_item, &bottom_separator, &quit_i])?;
+fn apply_ai_update_to_cached_snapshot(
+    platform_id: &str,
+    skill_id: &str,
+    ai_brief: &str,
+    ai_detail: &str,
+) -> Option<SkillsSnapshot> {
+    let mut cache = SNAPSHOT_CACHE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let entry = cache.as_mut()?;
 
-    Ok(menu)
+    let mut updated = false;
+    for platform in &mut entry.snapshot.platforms {
+        if platform.id != platform_id {
+            continue;
+        }
+        for skill in &mut platform.skills {
+            if skill.id != skill_id {
+                continue;
+            }
+            skill.ai_brief = ai_brief.to_string();
+            skill.ai_detail = ai_detail.to_string();
+            updated = true;
+            break;
+        }
+        if updated {
+            break;
+        }
+    }
+
+    if !updated {
+        return None;
+    }
+
+    entry.snapshot.ai_summarized_count = entry.snapshot.ai_summarized_count();
+    entry.snapshot.ai_pending_count = entry.snapshot.ai_pending_count();
+    entry.cached_at = system_time_to_unix_millis(SystemTime::now()).unwrap_or_default();
+    Some(entry.snapshot.clone())
 }
 
-fn find_skill_path(snapshot: &SkillsSnapshot, platform_id: &str, skill_id: &str) -> Option<String> {
+fn collapse_whitespace_to_single_line(input: &str) -> String {
+    input.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn truncate_with_ellipsis(input: &str, max_chars: usize) -> String {
+    if max_chars == 0 {
+        return String::new();
+    }
+
+    let chars = input.chars().collect::<Vec<_>>();
+    if chars.len() <= max_chars {
+        return input.to_string();
+    }
+
+    if max_chars <= 3 {
+        return ".".repeat(max_chars);
+    }
+
+    let keep = max_chars - 3;
+    let mut output = chars.into_iter().take(keep).collect::<String>();
+    output.push_str("...");
+    output
+}
+
+fn tray_favorite_summary(skill: &SkillData) -> String {
+    let raw = if !skill.ai_brief.trim().is_empty() {
+        skill.ai_brief.trim()
+    } else if !skill.source_description.trim().is_empty() {
+        skill.source_description.trim()
+    } else if !skill.source_usage.trim().is_empty() {
+        skill.source_usage.trim()
+    } else {
+        "暂无一句话解释"
+    };
+    let normalized = collapse_whitespace_to_single_line(raw);
+    if normalized.is_empty() {
+        return "暂无一句话解释".to_string();
+    }
+    truncate_with_ellipsis(&normalized, TRAY_FAVORITE_SUMMARY_MAX_CHARS)
+}
+
+fn find_skill_definition_path(
+    snapshot: &SkillsSnapshot,
+    platform_id: &str,
+    skill_id: &str,
+) -> Option<String> {
     snapshot
         .platforms
         .iter()
         .find(|platform| platform.id == platform_id)
         .and_then(|platform| platform.skills.iter().find(|skill| skill.id == skill_id))
-        .map(|skill| skill.path.clone())
+        .map(|skill| skill.definition_path.clone())
 }
 
 fn copy_text_to_clipboard(text: &str) -> Result<(), String> {
@@ -2413,92 +3180,139 @@ fn copy_text_to_clipboard(text: &str) -> Result<(), String> {
         .map_err(|err| format!("复制到剪贴板失败: {err}"))
 }
 
+fn build_tray_menu<R: tauri::Runtime, M: Manager<R>>(
+    manager: &M,
+    snapshot: &SkillsSnapshot,
+) -> tauri::Result<Menu<R>> {
+    let menu = Menu::new(manager)?;
+    let dashboard_item = MenuItem::with_id(
+        manager,
+        "open_dashboard",
+        "SkillsBox 面板",
+        true,
+        None::<&str>,
+    )?;
+    let hint_top_separator = PredefinedMenuItem::separator(manager)?;
+    let hint_item = MenuItem::with_id(
+        manager,
+        "favorites_hint",
+        "点击下面 skills 复制技能路径，粘贴给 AI 调用",
+        false,
+        None::<&str>,
+    )?;
+    let favorites_separator = PredefinedMenuItem::separator(manager)?;
+    let bottom_separator = PredefinedMenuItem::separator(manager)?;
+    let quit_i = MenuItem::with_id(manager, "quit", "Quit", true, None::<&str>)?;
+    menu.append(&dashboard_item)?;
+    menu.append(&hint_top_separator)?;
+    menu.append(&hint_item)?;
+    menu.append(&favorites_separator)?;
+
+    let mut favorites = snapshot
+        .platforms
+        .iter()
+        .flat_map(|platform| {
+            platform
+                .skills
+                .iter()
+                .filter(|skill| skill.favorite)
+                .map(move |skill| (platform.id.as_str(), skill))
+        })
+        .collect::<Vec<_>>();
+
+    favorites.sort_by(|(platform_id_a, skill_a), (platform_id_b, skill_b)| {
+        skill_a
+            .name
+            .to_lowercase()
+            .cmp(&skill_b.name.to_lowercase())
+            .then_with(|| skill_a.id.to_lowercase().cmp(&skill_b.id.to_lowercase()))
+            .then_with(|| platform_id_a.cmp(platform_id_b))
+    });
+
+    if favorites.is_empty() {
+        let empty_item =
+            MenuItem::with_id(manager, "favorites_empty", "暂无收藏", false, None::<&str>)?;
+        menu.append(&empty_item)?;
+    } else {
+        for (platform_id, skill) in favorites {
+            let item_id = format!("favorite::{platform_id}::{}", skill.id);
+            let item_label = format!("{}（{}）", skill.name, tray_favorite_summary(skill));
+            let item = MenuItem::with_id(manager, item_id, item_label, true, None::<&str>)?;
+            menu.append(&item)?;
+        }
+    }
+
+    menu.append(&bottom_separator)?;
+    menu.append(&quit_i)?;
+
+    Ok(menu)
+}
+
+fn flush_tray_menu_updates_on_main<R: tauri::Runtime>(app_handle: &tauri::AppHandle<R>) {
+    loop {
+        let snapshot = {
+            let mut state = TRAY_MENU_UPDATE_STATE
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            match state.latest_snapshot.take() {
+                Some(snapshot) => Some(snapshot),
+                None => {
+                    state.pending = false;
+                    None
+                }
+            }
+        };
+
+        let Some(snapshot) = snapshot else {
+            break;
+        };
+
+        let Ok(menu) = build_tray_menu(app_handle, &snapshot) else {
+            continue;
+        };
+        if let Some(tray) = app_handle.tray_by_id("main") {
+            let _ = tray.set_menu(Some(menu));
+        }
+    }
+}
+
 fn set_tray_menu_from_snapshot<R: tauri::Runtime>(
     app: &tauri::AppHandle<R>,
-    _snapshot: &SkillsSnapshot,
+    snapshot: &SkillsSnapshot,
 ) {
-    let Ok(menu) = build_tray_menu(app) else {
-        return;
+    let should_schedule = {
+        let mut state = TRAY_MENU_UPDATE_STATE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.latest_snapshot = Some(snapshot.clone());
+        if state.pending {
+            false
+        } else {
+            state.pending = true;
+            true
+        }
     };
-    if let Some(tray) = app.tray_by_id("main") {
-        let _ = tray.set_menu(Some(menu));
-    }
-}
 
-fn list_tray_favorites_internal() -> Vec<TrayFavoriteSkill> {
-    let snapshot = load_skills_snapshot_internal(false, false);
-    let mut favorites = Vec::<TrayFavoriteSkill>::new();
-
-    for platform in &snapshot.platforms {
-        for skill in &platform.skills {
-            if !skill.favorite {
-                continue;
-            }
-
-            let summary = if !skill.ai_brief.trim().is_empty() {
-                skill.ai_brief.trim().to_string()
-            } else if !skill.source_description.trim().is_empty() {
-                skill.source_description.trim().to_string()
-            } else if !skill.source_usage.trim().is_empty() {
-                skill.source_usage.trim().to_string()
-            } else {
-                "暂无一句话总结".to_string()
-            };
-
-            favorites.push(TrayFavoriteSkill {
-                platform_id: platform.id.clone(),
-                skill_id: skill.id.clone(),
-                name: skill.name.clone(),
-                summary,
-            });
-        }
-    }
-
-    favorites.sort_by(|left, right| {
-        left.name
-            .to_lowercase()
-            .cmp(&right.name.to_lowercase())
-            .then_with(|| left.skill_id.to_lowercase().cmp(&right.skill_id.to_lowercase()))
-    });
-    favorites
-}
-
-fn open_tray_panel<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
-    if let Some(window) = app.get_webview_window("tray_panel") {
-        if window.is_visible().unwrap_or(false) {
-            let _ = window.hide();
-            return;
-        }
-        let _ = window.show();
-        let _ = window.unminimize();
-        let _ = window.set_focus();
+    if !should_schedule {
         return;
     }
 
-    let mut builder = WebviewWindowBuilder::new(app, "tray_panel", WebviewUrl::default())
-        .title("Skills Box")
-        .inner_size(420.0, 560.0)
-        .min_inner_size(360.0, 420.0)
-        .resizable(true)
-        .visible(true)
-        .always_on_top(true)
-        .skip_taskbar(true)
-        .center();
-
-    #[cfg(target_os = "macos")]
+    let app_handle = app.clone();
+    if app_handle
+        .clone()
+        .run_on_main_thread(move || flush_tray_menu_updates_on_main(&app_handle))
+        .is_err()
     {
-        builder = builder
-            .hidden_title(true)
-            .traffic_light_position(tauri::LogicalPosition::new(14.0, 14.0));
-    }
-
-    if let Ok(window) = builder.build() {
-        let _ = window.set_focus();
+        let mut state = TRAY_MENU_UPDATE_STATE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.pending = false;
     }
 }
 
 fn open_dashboard<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
     if let Some(window) = app.get_webview_window("dashboard") {
+        let _ = window.set_title("");
         let _ = window.show();
         let _ = window.unminimize();
         let _ = window.set_focus();
@@ -2506,9 +3320,9 @@ fn open_dashboard<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
     }
 
     let mut builder = WebviewWindowBuilder::new(app, "dashboard", WebviewUrl::default())
-        .title("Skills Box Dashboard")
-        .inner_size(1024.0, 740.0)
-        .min_inner_size(860.0, 600.0)
+        .title("")
+        .inner_size(1024.0, 820.0)
+        .min_inner_size(860.0, 640.0)
         .resizable(true)
         .decorations(true)
         .visible(true)
@@ -2539,7 +3353,8 @@ fn refresh_skills_with_auto_ai_internal(app: tauri::AppHandle) -> SkillsSnapshot
         None,
     );
 
-    let previous_snapshot = load_skills_snapshot_internal(false, false);
+    let previous_snapshot = load_cached_snapshot_any_age()
+        .unwrap_or_else(|| load_skills_snapshot_internal(false, false));
     let mut snapshot = load_skills_snapshot_internal(true, false);
 
     let previous_keys = skill_keys(&previous_snapshot);
@@ -2647,7 +3462,7 @@ fn refresh_skills_with_auto_ai_internal(app: tauri::AppHandle) -> SkillsSnapshot
             continue;
         };
 
-        let Ok(profile) = call_deepseek_profile(platform_name, skill, &api_key) else {
+        let Ok(profile) = call_deepseek_profile(platform_name, skill, &api_key, None) else {
             continue;
         };
 
@@ -2725,46 +3540,38 @@ fn get_ai_settings_status() -> AiSettingsStatus {
 }
 
 #[tauri::command]
+fn get_onboarding_status() -> bool {
+    let config = load_app_config();
+    match config.onboarding_completed {
+        Some(completed) => !completed,
+        None => !app_config_exists(),
+    }
+}
+
+#[tauri::command]
+fn complete_onboarding() -> Result<(), String> {
+    let mut config = load_app_config();
+    if config.onboarding_completed == Some(true) {
+        return Ok(());
+    }
+    config.onboarding_completed = Some(true);
+    save_app_config(&config).map_err(|err| format!("保存引导状态失败: {err}"))
+}
+
+#[tauri::command]
 fn get_app_version(app: tauri::AppHandle) -> String {
     app.package_info().version.to_string()
 }
 
 #[tauri::command]
-fn get_window_label(window: tauri::Window) -> String {
-    window.label().to_string()
-}
-
-#[tauri::command]
-fn list_tray_favorites() -> Vec<TrayFavoriteSkill> {
-    list_tray_favorites_internal()
-}
-
-#[tauri::command]
-fn copy_skill_path_for_tray(payload: TraySkillPayload) -> Result<String, String> {
-    let snapshot = load_skills_snapshot_internal(false, false);
-    let Some(path) = find_skill_path(&snapshot, &payload.platform_id, &payload.skill_id) else {
-        return Err("未找到对应技能路径".to_string());
-    };
-    copy_text_to_clipboard(&path)?;
-    Ok(path)
-}
-
-#[tauri::command]
-fn open_dashboard_window(app: tauri::AppHandle) {
-    open_dashboard(&app);
-}
-
-#[tauri::command]
-fn hide_tray_panel_window(app: tauri::AppHandle) {
-    if let Some(window) = app.get_webview_window("tray_panel") {
-        let _ = window.hide();
-    }
+fn restart_app(app: tauri::AppHandle) {
+    app.request_restart();
 }
 
 #[tauri::command]
 async fn check_for_updates(app: tauri::AppHandle) -> Result<UpdateCheckResult, String> {
     let current_version = app.package_info().version.to_string();
-    tauri::async_runtime::spawn_blocking(move || check_for_updates_internal(current_version))
+    tauri::async_runtime::spawn_blocking(move || check_for_updates_cached_internal(current_version))
         .await
         .unwrap_or_else(|err| Err(format!("后台任务失败: {err}")))
 }
@@ -2823,7 +3630,9 @@ async fn test_deepseek_api_key() -> Result<String, String> {
 async fn summarize_pending_skills(app: tauri::AppHandle) -> Result<SkillsSnapshot, String> {
     let app_for_task = app.clone();
     let result = tauri::async_runtime::spawn_blocking(move || {
-        let _job_queue_guard = lock_ai_summary_job_queue();
+        let cancel_epoch = current_ai_summary_cancel_epoch();
+        let _job_queue_guard = try_lock_ai_summary_job_queue(Some(cancel_epoch))?;
+        ensure_ai_summary_not_cancelled(Some(cancel_epoch))?;
         let api_key =
             deepseek_api_key().ok_or_else(|| "请先在设置中填写 DeepSeek Key".to_string())?;
         test_deepseek_api_key_request(&api_key)?;
@@ -2840,11 +3649,32 @@ async fn summarize_pending_skills(app: tauri::AppHandle) -> Result<SkillsSnapsho
 fn resummarize_all_skills_internal<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,
 ) -> Result<SkillsSnapshot, String> {
-    let _job_queue_guard = lock_ai_summary_job_queue();
+    let job_started_at = Instant::now();
+    eprintln!("[resummarize_all] internal start");
+    let cancel_epoch = current_ai_summary_cancel_epoch();
+    let _job_queue_guard = try_lock_ai_summary_job_queue(Some(cancel_epoch))?;
+    ensure_ai_summary_not_cancelled(Some(cancel_epoch))?;
+    eprintln!("[resummarize_all] lock acquired");
     let api_key = deepseek_api_key().ok_or_else(|| "请先在设置中填写 DeepSeek Key".to_string())?;
+    eprintln!("[resummarize_all] api key loaded");
 
-    let mut snapshot = load_skills_snapshot_internal(true, false);
-    let mut targets = Vec::<(usize, usize, String)>::new();
+    emit_scan_progress(
+        &app,
+        "resummarize_all_start",
+        "正在整理待总结技能...".to_string(),
+        0,
+        0,
+        0,
+        None,
+    );
+
+    let mut snapshot = load_cached_snapshot_any_age()
+        .unwrap_or_else(|| load_skills_snapshot_internal(false, false));
+    eprintln!(
+        "[resummarize_all] snapshot ready in {:?}",
+        job_started_at.elapsed()
+    );
+    let mut targets = Vec::<(usize, usize, String, i64, String)>::new();
     for (platform_index, platform) in snapshot.platforms.iter().enumerate() {
         for (skill_index, skill) in platform.skills.iter().enumerate() {
             if skill.source_description.trim().is_empty()
@@ -2853,11 +3683,31 @@ fn resummarize_all_skills_internal<R: tauri::Runtime>(
             {
                 continue;
             }
-            targets.push((platform_index, skill_index, skill.name.clone()));
+            let order_time = skill
+                .first_seen_at
+                .or(skill.installed_at)
+                .unwrap_or_default();
+            targets.push((
+                platform_index,
+                skill_index,
+                skill.name.clone(),
+                order_time,
+                skill.id.clone(),
+            ));
         }
     }
 
+    targets.sort_by(
+        |(_p1, _s1, name1, time1, id1), (_p2, _s2, name2, time2, id2)| {
+            time2
+                .cmp(time1)
+                .then_with(|| name1.to_lowercase().cmp(&name2.to_lowercase()))
+                .then_with(|| id1.to_lowercase().cmp(&id2.to_lowercase()))
+        },
+    );
+
     let summarize_total = targets.len();
+    eprintln!("[resummarize_all] targets={summarize_total}");
     emit_scan_progress(
         &app,
         "resummarize_all_start",
@@ -2868,6 +3718,7 @@ fn resummarize_all_skills_internal<R: tauri::Runtime>(
         None,
     );
     if summarize_total == 0 {
+        eprintln!("[resummarize_all] nothing to summarize");
         emit_scan_progress(
             &app,
             "resummarize_all_done",
@@ -2880,25 +3731,19 @@ fn resummarize_all_skills_internal<R: tauri::Runtime>(
         return Ok(snapshot);
     }
 
-    if let Err(err) = test_deepseek_api_key_request(&api_key) {
-        emit_scan_progress(
-            &app,
-            "resummarize_all_warning",
-            format!("连通性预检失败，仍继续执行：{err}"),
-            0,
-            0,
-            summarize_total,
-            None,
-        );
-    }
-
     let mut overrides = load_overrides();
     let mut changed = false;
     let mut summarized_count = 0usize;
     let mut failed_count = 0usize;
     let mut first_error: Option<String> = None;
 
-    for (index, (platform_index, skill_index, skill_name)) in targets.iter().enumerate() {
+    for (index, (platform_index, skill_index, skill_name, _order_time, _skill_id)) in
+        targets.iter().enumerate()
+    {
+        ensure_ai_summary_not_cancelled(Some(cancel_epoch))?;
+        if index == 0 {
+            eprintln!("[resummarize_all] enter summarize loop");
+        }
         emit_scan_progress(
             &app,
             "resummarize_all_progress",
@@ -2916,12 +3761,32 @@ fn resummarize_all_skills_internal<R: tauri::Runtime>(
 
         let platform_name = snapshot.platforms[*platform_index].name.clone();
         let platform_id = snapshot.platforms[*platform_index].id.clone();
-        let skill_id = snapshot.platforms[*platform_index].skills[*skill_index].id.clone();
+        let skill_id = snapshot.platforms[*platform_index].skills[*skill_index]
+            .id
+            .clone();
         let skill_for_ai = snapshot.platforms[*platform_index].skills[*skill_index].clone();
 
-        let profile = match call_deepseek_profile(&platform_name, &skill_for_ai, &api_key) {
+        let profile = match call_deepseek_profile(
+            &platform_name,
+            &skill_for_ai,
+            &api_key,
+            Some(cancel_epoch),
+        ) {
             Ok(profile) => profile,
             Err(err) => {
+                if is_ai_summary_cancel_error(&err) {
+                    emit_scan_progress(
+                        &app,
+                        "resummarize_all_stopped",
+                        "任务已停止。".to_string(),
+                        0,
+                        summarized_count,
+                        summarize_total,
+                        None,
+                    );
+                    return Err(err);
+                }
+                eprintln!("[resummarize_all] summarize failed: {skill_name}: {err}");
                 failed_count += 1;
                 if first_error.is_none() {
                     first_error = Some(err.clone());
@@ -2960,8 +3825,8 @@ fn resummarize_all_skills_internal<R: tauri::Runtime>(
     write_snapshot_cache(&snapshot);
 
     if summarized_count == 0 && failed_count > 0 {
-        let error_message = first_error
-            .unwrap_or_else(|| "全部请求失败，未拿到可用结果".to_string());
+        let error_message =
+            first_error.unwrap_or_else(|| "全部请求失败，未拿到可用结果".to_string());
         let final_message = format!(
             "全部重新总结失败：成功 0/{summarize_total}，失败 {failed_count}。首个错误：{error_message}"
         );
@@ -2973,6 +3838,11 @@ fn resummarize_all_skills_internal<R: tauri::Runtime>(
             summarized_count,
             summarize_total,
             None,
+        );
+        eprintln!(
+            "[resummarize_all] all failed after {:?}: {}",
+            job_started_at.elapsed(),
+            final_message
         );
         return Err(final_message);
     }
@@ -2988,11 +3858,22 @@ fn resummarize_all_skills_internal<R: tauri::Runtime>(
         summarize_total,
         None,
     );
+    eprintln!(
+        "[resummarize_all] done in {:?}, success={}, failed={}",
+        job_started_at.elapsed(),
+        summarized_count,
+        failed_count
+    );
     Ok(snapshot)
 }
 
-fn resummarize_skill_internal(payload: ResummarizeSkillPayload) -> Result<SkillsSnapshot, String> {
-    let _job_queue_guard = lock_ai_summary_job_queue();
+fn resummarize_skill_internal<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    payload: ResummarizeSkillPayload,
+) -> Result<SkillsSnapshot, String> {
+    let cancel_epoch = current_ai_summary_cancel_epoch();
+    let _job_queue_guard = try_lock_ai_summary_job_queue(Some(cancel_epoch))?;
+    ensure_ai_summary_not_cancelled(Some(cancel_epoch))?;
     let api_key = deepseek_api_key().ok_or_else(|| "请先在设置中填写 DeepSeek Key".to_string())?;
 
     let mut snapshot = load_skills_snapshot_internal(false, false);
@@ -3030,23 +3911,42 @@ fn resummarize_skill_internal(payload: ResummarizeSkillPayload) -> Result<Skills
     };
 
     let platform_name = snapshot.platforms[platform_index].name.clone();
+    let platform_id = payload.platform_id.clone();
+    let skill_id = payload.skill_id.clone();
     let skill_for_ai = snapshot.platforms[platform_index].skills[skill_index].clone();
-    let profile = call_deepseek_profile(&platform_name, &skill_for_ai, &api_key)?;
+    let profile = match call_deepseek_profile_streaming(
+        &app,
+        &platform_id,
+        &skill_id,
+        &platform_name,
+        &skill_for_ai,
+        &api_key,
+        Some(cancel_epoch),
+    ) {
+        Ok(profile) => profile,
+        Err(err) => {
+            if is_ai_summary_cancel_error(&err) {
+                return Err(err);
+            }
+            eprintln!("[resummarize_skill] stream fallback: {err}");
+            call_deepseek_profile(&platform_name, &skill_for_ai, &api_key, Some(cancel_epoch))?
+        }
+    };
 
     let skill = &mut snapshot.platforms[platform_index].skills[skill_index];
     skill.ai_brief = profile.brief.clone();
     skill.ai_detail = profile.detail.clone();
 
-    let mut overrides = load_overrides();
-    let key = override_key(&payload.platform_id, &payload.skill_id);
-    let mut entry = overrides.entries.get(&key).cloned().unwrap_or_default();
-    entry.ai_brief = Some(profile.brief);
-    entry.ai_detail = Some(profile.detail);
-    overrides.entries.insert(key, entry);
-    save_overrides(&overrides).map_err(|err| format!("保存技能设置失败: {err}"))?;
+    upsert_ai_override_entry(&platform_id, &skill_id, &profile.brief, &profile.detail)
+        .map_err(|err| format!("保存技能设置失败: {err}"))?;
 
     snapshot.ai_summarized_count = snapshot.ai_summarized_count();
     snapshot.ai_pending_count = snapshot.ai_pending_count();
+    if let Some(merged) =
+        apply_ai_update_to_cached_snapshot(&platform_id, &skill_id, &profile.brief, &profile.detail)
+    {
+        return Ok(merged);
+    }
     write_snapshot_cache(&snapshot);
     Ok(snapshot)
 }
@@ -3056,11 +3956,13 @@ async fn resummarize_skill(
     app: tauri::AppHandle,
     payload: ResummarizeSkillPayload,
 ) -> Result<SkillsSnapshot, String> {
+    let app_for_job = app.clone();
     let app_for_task = app.clone();
-    let snapshot =
-        tauri::async_runtime::spawn_blocking(move || resummarize_skill_internal(payload))
-            .await
-            .unwrap_or_else(|err| Err(format!("后台任务失败: {err}")))?;
+    let snapshot = tauri::async_runtime::spawn_blocking(move || {
+        resummarize_skill_internal(app_for_job, payload)
+    })
+    .await
+    .unwrap_or_else(|err| Err(format!("后台任务失败: {err}")))?;
 
     set_tray_menu_from_snapshot(&app_for_task, &snapshot);
     emit_skills_snapshot(&app_for_task, &snapshot);
@@ -3069,14 +3971,25 @@ async fn resummarize_skill(
 
 #[tauri::command]
 async fn resummarize_all_skills(app: tauri::AppHandle) -> Result<SkillsSnapshot, String> {
+    eprintln!("[resummarize_all] command received");
+    emit_scan_progress(
+        &app,
+        "resummarize_all_start",
+        "任务已提交，等待后台执行...".to_string(),
+        0,
+        0,
+        0,
+        None,
+    );
+
     let app_for_job = app.clone();
     let app_for_task = app.clone();
-    let snapshot = tauri::async_runtime::spawn_blocking(move || {
-        resummarize_all_skills_internal(app_for_job)
-    })
-        .await
-        .unwrap_or_else(|err| Err(format!("后台任务失败: {err}")))?;
+    let snapshot =
+        tauri::async_runtime::spawn_blocking(move || resummarize_all_skills_internal(app_for_job))
+            .await
+            .unwrap_or_else(|err| Err(format!("后台任务失败: {err}")))?;
 
+    eprintln!("[resummarize_all] command completed");
     set_tray_menu_from_snapshot(&app_for_task, &snapshot);
     emit_skills_snapshot(&app_for_task, &snapshot);
     Ok(snapshot)
@@ -3127,50 +4040,68 @@ fn update_skill(
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(|app| {
+            #[cfg(target_os = "macos")]
+            {
+                let _ = app
+                    .handle()
+                    .set_activation_policy(tauri::ActivationPolicy::Accessory);
+            }
+
             let snapshot = load_skills_snapshot_internal(true, false);
-            let tray_menu = build_tray_menu(app)?;
+            let tray_menu = build_tray_menu(app, &snapshot)?;
             let app_handle = app.handle().clone();
-            
+
             // Build the main application menu
             let default_menu = Menu::default(app.handle())?;
             app.set_menu(default_menu)?;
 
-            let tray_icon = tauri::image::Image::from_bytes(include_bytes!("../icons/tray/36x36.png"))?;
+            let tray_icon =
+                tauri::image::Image::from_bytes(include_bytes!("../icons/tray/36x36.png"))?;
 
             TrayIconBuilder::with_id("main")
                 .icon(tray_icon)
                 .icon_as_template(true)
                 .menu(&tray_menu)
                 .show_menu_on_left_click(true)
-                .on_menu_event(|app, event| match event.id.as_ref() {
-                    "open_dashboard" => {
-                        open_dashboard(app);
-                    }
-                    "quit" => {
-                        app.exit(0);
-                    }
-                    id if id == "tray_title"
-                        || id == "tray_hint"
-                        || id == "favorites_empty"
-                        || id.starts_with("skill_note::") => {}
-                    id if id.starts_with("skill::") => {
-                        let mut parts = id.splitn(3, "::");
-                        let _ = parts.next();
-                        let platform_id = parts.next().unwrap_or_default();
-                        let skill_id = parts.next().unwrap_or_default();
-                        if platform_id.is_empty() || skill_id.is_empty() {
-                            return;
+                .on_menu_event(|app, event| {
+                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match event
+                        .id
+                        .as_ref()
+                    {
+                        "open_dashboard" => {
+                            open_dashboard(app);
                         }
+                        "quit" => {
+                            app.exit(0);
+                        }
+                        id if id.starts_with("favorite::") => {
+                            let mut parts = id.splitn(3, "::");
+                            let _ = parts.next();
+                            let platform_id = parts.next().unwrap_or_default();
+                            let skill_id = parts.next().unwrap_or_default();
+                            if platform_id.is_empty() || skill_id.is_empty() {
+                                return;
+                            }
 
-                        let snapshot = load_skills_snapshot_internal(false, false);
-                        if let Some(path) = find_skill_path(&snapshot, platform_id, skill_id) {
-                            let _ = copy_text_to_clipboard(&path);
+                            let Some(snapshot) = load_cached_snapshot_any_age() else {
+                                return;
+                            };
+                            if let Some(path) =
+                                find_skill_definition_path(&snapshot, platform_id, skill_id)
+                            {
+                                let _ = copy_text_to_clipboard(&path);
+                            }
                         }
-                    }
-                    _ => {}
+                        _ => {}
+                    }));
                 })
                 .build(app)?;
+
+            if get_onboarding_status() {
+                open_dashboard(app.handle());
+            }
 
             start_filesystem_watcher(app_handle);
 
@@ -3182,14 +4113,20 @@ pub fn run() {
             refresh_skills_with_auto_ai,
             update_skill,
             get_ai_settings_status,
+            get_onboarding_status,
+            complete_onboarding,
             get_app_version,
+            restart_app,
             check_for_updates,
             set_deepseek_api_key,
             test_deepseek_api_key,
             summarize_pending_skills,
             resummarize_skill,
-            resummarize_all_skills
+            resummarize_all_skills,
+            cancel_ai_summary_jobs,
+            get_resummarize_all_progress,
+            get_ai_summary_stream_latest
         ])
         .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .unwrap_or_else(|err| eprintln!("error while running tauri application: {err}"));
 }
