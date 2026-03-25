@@ -59,6 +59,8 @@ SkillsBox 提供独立下载入口，统一从发布页获取安装包。
 1. 去 [DeepSeek 开放平台](https://platform.deepseek.com/api_keys) 申请一个 API Key。
 2. 在 SkillsBox 设置里填入 Key 并测试通过。
 
+说明：这个 API Key 只用于 Skills 的总结与翻译，调用量通常比较省，充值 5 元一般就能用很久（视你的使用频率而定）。
+
 ![SkillsBox DeepSeek 设置](docs/screenshots/skills-box-settings.png)
 
 ## 本地开发运行
