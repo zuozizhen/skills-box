@@ -68,7 +68,7 @@ jobs:
           - runner: macos-14
             label: Apple-Silicon
             arch: aarch64
-          - runner: macos-13
+          - runner: macos-15-intel
             label: Intel
             arch: x86_64
     steps:
