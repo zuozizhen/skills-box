@@ -67,6 +67,10 @@ jobs:
         include:
           - runner: macos-14
             label: Apple-Silicon
+            arch: aarch64
+          - runner: macos-13
+            label: Intel
+            arch: x86_64
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -157,11 +161,30 @@ jobs:
           codesign --verify --deep --strict --verbose=2 "$app_path"
           spctl -a -t exec -vv "$app_path"
 
-      - name: Generate updater latest.json
+      - name: Prepare release payload
         env:
           GH_REPO: ${{ github.repository }}
           TAG: ${{ needs.create-draft-release.outputs.tag }}
+          ARCH: ${{ matrix.arch }}
         run: |
+          set -euo pipefail
+
+          version="${TAG#v}"
+          staging_dir="release-payload/${ARCH}"
+          mkdir -p "$staging_dir"
+
+          dmg_file="$(find src-tauri/target/release/bundle -type f -name '*.dmg' | head -n 1)"
+          if [ -z "$dmg_file" ]; then
+            echo "No dmg bundle found."
+            exit 1
+          fi
+          cp -f "$dmg_file" "$staging_dir/"
+
+          dmg_sig="${dmg_file}.sig"
+          if [ -f "$dmg_sig" ]; then
+            cp -f "$dmg_sig" "$staging_dir/"
+          fi
+
           updater_archive="$(find src-tauri/target/release/bundle -type f -name '*.app.tar.gz' | head -n 1)"
           if [ -z "$updater_archive" ]; then
             echo "No updater archive (*.app.tar.gz) found."
@@ -174,17 +197,14 @@ jobs:
             exit 1
           fi
 
-          arch="aarch64"
-          case "$updater_archive" in
-            *x86_64*) arch="x86_64" ;;
-            *aarch64*) arch="aarch64" ;;
-          esac
+          updater_asset_name="skills-box_${version}_${ARCH}.app.tar.gz"
+          updater_sig_name="${updater_asset_name}.sig"
+          cp -f "$updater_archive" "$staging_dir/$updater_asset_name"
+          cp -f "$sig_file" "$staging_dir/$updater_sig_name"
 
-          version="${TAG#v}"
-          asset_name="$(basename "$updater_archive")"
           signature="$(tr -d '\r\n' < "$sig_file")"
           pub_date="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
-          latest_json_path="src-tauri/target/release/bundle/latest.json"
+          latest_json_path="$staging_dir/latest.${ARCH}.json"
 
           cat > "$latest_json_path" <<EOF
           {
@@ -192,35 +212,25 @@ jobs:
             "notes": "skills-box $TAG",
             "pub_date": "$pub_date",
             "platforms": {
-              "darwin-$arch": {
+              "darwin-$ARCH": {
                 "signature": "$signature",
-                "url": "https://github.com/$GH_REPO/releases/download/$TAG/$asset_name"
+                "url": "https://github.com/$GH_REPO/releases/download/$TAG/$updater_asset_name"
               },
-              "darwin-$arch-app": {
+              "darwin-$ARCH-app": {
                 "signature": "$signature",
-                "url": "https://github.com/$GH_REPO/releases/download/$TAG/$asset_name"
+                "url": "https://github.com/$GH_REPO/releases/download/$TAG/$updater_asset_name"
               }
             }
           }
           EOF
-          echo "Generated updater manifest: $latest_json_path"
+          echo "Prepared payload in: $staging_dir"
 
-      - name: Upload artifacts to draft release
-        env:
-          GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ github.repository }}
-          TAG: ${{ needs.create-draft-release.outputs.tag }}
-        run: |
-          files="$(find src-tauri/target/release/bundle -type f \( -name '*.dmg' -o -name '*.app.tar.gz' -o -name '*.dmg.sig' -o -name '*.app.tar.gz.sig' -o -name 'latest.json' \) -print)"
-          if [ -z "$files" ]; then
-            echo "No macOS bundle artifacts found."
-            exit 1
-          fi
-          echo "$files" | while IFS= read -r file; do
-            [ -z "$file" ] && continue
-            echo "Uploading: $file"
-            gh release upload "$TAG" "$file" --repo "$GH_REPO" --clobber
-          done
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-payload-${{ matrix.arch }}
+          path: release-payload/${{ matrix.arch }}
+          if-no-files-found: error
 
   publish-release:
     name: Publish Release
@@ -229,6 +239,52 @@ jobs:
       - build-macos
     runs-on: ubuntu-latest
     steps:
+      - name: Download build payloads
+        uses: actions/download-artifact@v4
+        with:
+          path: release-payload
+          merge-multiple: true
+
+      - name: Generate combined updater latest.json
+        env:
+          TAG: ${{ needs.create-draft-release.outputs.tag }}
+        run: |
+          set -euo pipefail
+          version="${TAG#v}"
+          pub_date="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+
+          json_files="$(find release-payload -type f -name 'latest.*.json' -print)"
+          if [ -z "$json_files" ]; then
+            echo "No partial updater manifest files found."
+            exit 1
+          fi
+
+          jq -s \
+            --arg version "$version" \
+            --arg notes "skills-box $TAG" \
+            --arg pub_date "$pub_date" \
+            '{version:$version,notes:$notes,pub_date:$pub_date,platforms:(map(.platforms)|add)}' \
+            $json_files > release-payload/latest.json
+
+          rm -f release-payload/latest.*.json
+
+      - name: Upload artifacts to draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ needs.create-draft-release.outputs.tag }}
+        run: |
+          files="$(find release-payload -type f \( -name '*.dmg' -o -name '*.dmg.sig' -o -name '*.app.tar.gz' -o -name '*.app.tar.gz.sig' -o -name 'latest.json' \) -print)"
+          if [ -z "$files" ]; then
+            echo "No release payload files found."
+            exit 1
+          fi
+          echo "$files" | while IFS= read -r file; do
+            [ -z "$file" ] && continue
+            echo "Uploading: $file"
+            gh release upload "$TAG" "$file" --repo "$GH_REPO" --clobber
+          done
+
       - name: Publish draft release
         env:
           GH_TOKEN: ${{ github.token }}
